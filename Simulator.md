@@ -46,7 +46,7 @@ This lets us test coordination, failure handling, and task hand-off logic (e.g. 
 
 ## Tech stack
 
-- **Frontend:** Next.js (map UI, control panel)
+- **Frontend:** Next.js (map UI CSS Tailwind u, control panel)
 - **Backend/Orchestrator:** FastAPI + Docker SDK for Python
 - **Robots:** Lightweight FastAPI containers, one per robot
 - **Networking:** Docker bridge network, containers communicate via HTTP or WebSocket
