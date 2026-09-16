@@ -1,0 +1,65 @@
+# 5-robot fleet from a single image ("lastmile").
+# Each container is one robot on a shared bridge network (robot-net),
+# reachable by its container name (robot1..robot5).
+#
+#   docker compose up --build     # builds lastmile once, starts 5 robots
+#
+# Robot ports are published to the host as 8001..8005 for local poking.
+
+x-robot: &robot
+  image: lastmile
+  build: ./robot
+  networks:
+    - robot-net
+  restart: unless-stopped
+
+services:
+  robot1:
+    <<: *robot
+    container_name: robot1
+    environment:
+      ROBOT_ID: robot1
+      PEERS: robot2,robot3,robot4,robot5
+    ports:
+      - "8001:8000"
+
+  robot2:
+    <<: *robot
+    container_name: robot2
+    environment:
+      ROBOT_ID: robot2
+      PEERS: robot1,robot3,robot4,robot5
+    ports:
+      - "8002:8000"
+
+  robot3:
+    <<: *robot
+    container_name: robot3
+    environment:
+      ROBOT_ID: robot3
+      PEERS: robot1,robot2,robot4,robot5
+    ports:
+      - "8003:8000"
+
+  robot4:
+    <<: *robot
+    container_name: robot4
+    environment:
+      ROBOT_ID: robot4
+      PEERS: robot1,robot2,robot3,robot5
+    ports:
+      - "8004:8000"
+
+  robot5:
+    <<: *robot
+    container_name: robot5
+    environment:
+      ROBOT_ID: robot5
+      PEERS: robot1,robot2,robot3,robot4
+    ports:
+      - "8005:8000"
+
+networks:
+  robot-net:
+    name: robot-net
+    driver: bridge
