@@ -1,7 +1,16 @@
-import { getContainer } from "../../../../lib/fleet";
+import { getContainer, isSwarmActive, setSwarmPower } from "../../../../lib/fleet";
 
 export async function POST(req, { params }) {
   const { on } = await req.json();
+
+  if (await isSwarmActive()) {
+    // Power in swarm mode = scaling the service's replica count 0/1,
+    // since the robot may be running on a different physical machine.
+    const result = await setSwarmPower(params.name, on);
+    if (!result) return Response.json({ error: "not found" }, { status: 404 });
+    return Response.json(result);
+  }
+
   const c = await getContainer(params.name);
   if (!c) return Response.json({ error: "not found" }, { status: 404 });
   try {
