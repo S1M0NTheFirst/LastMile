@@ -68,3 +68,82 @@ curl localhost:8003/state
 A `503` means the target is `dead`/`no_response`; a name-resolution error means
 it is powered off.
 
+## Run across multiple machines (Docker Swarm)
+
+`docker compose` only networks containers on one machine. To spread robots
+across multiple computers and still have them reach each other by name, join
+the machines into a **Docker Swarm** and deploy on its **overlay network**
+(an overlay network is routed between hosts, unlike the local `bridge`
+network `docker compose` uses).
+
+**1. Pick one machine as the manager and initialize the swarm:**
+
+```bash
+# on machine A — use the IP the other machine can reach it at
+docker swarm init --advertise-addr <machine-A-ip>
+```
+
+This prints a `docker swarm join --token ...` command.
+
+**2. Join the other machine(s) as workers:**
+
+```bash
+# on machine B, paste the command machine A printed
+docker swarm join --token <token> <machine-A-ip>:2377
+```
+
+Confirm both are in the cluster (run on the manager):
+
+```bash
+docker node ls
+```
+
+**3. Build the robot image on every machine** (swarm doesn't build images,
+it only runs them — every node needs `lastmile` available locally, or you
+push it to a registry all nodes can pull from):
+
+```bash
+docker build -t lastmile ./robot
+```
+
+**4. Deploy the fleet as a stack** (from the manager only):
+
+```bash
+docker stack deploy -c docker-stack.yml lastmile
+```
+
+Swarm schedules the 5 robot services across whichever nodes have capacity —
+some may land on machine A, some on machine B — and they can still reach
+each other by name (`robot1`, `robot2`, ...) because `docker-stack.yml`
+uses an `overlay` network instead of a `bridge`.
+
+**5. Verify:**
+
+```bash
+docker service ls                     # all 5 should show 1/1
+curl localhost:8001/state             # works from either machine
+
+# prove cross-machine messaging: pick two robots and check they can talk
+curl -X POST localhost:8001/send \
+  -H 'Content-Type: application/json' \
+  -d '{"to":"robot4","body":{"msg":"hello from another host"}}'
+curl localhost:8004/state             # message should be in the inbox
+```
+
+**Tear down:**
+
+```bash
+docker stack rm lastmile              # remove the fleet
+docker swarm leave --force            # on a worker, to leave the cluster
+docker swarm leave --force            # on the manager, to disband it (last)
+```
+
+### Why this works
+
+Docker Swarm gives every service a place in a cluster-wide DNS, backed by an
+overlay network (VXLAN tunnels between hosts). A container on machine B can
+resolve `robot1` and reach it exactly like `robot-net` in the single-machine
+setup, even though the container actually runs on machine A. Ports you
+publish (`8001:8000` etc.) are also reachable from **any** node's IP, not
+just the one running that container, via Swarm's routing mesh.
+

@@ -1,0 +1,68 @@
+# Multi-machine fleet using Docker Swarm.
+# Same 5 robots, but on an *overlay* network instead of a local bridge, so
+# containers reach each other by service name even when they run on
+# different physical/VM hosts joined to the same swarm.
+#
+# Usage (see README "Run across multiple machines" for the full walkthrough):
+#
+#   docker build -t lastmile ./robot          # build once, on every node (or push to a registry)
+#   docker stack deploy -c docker-stack.yml lastmile
+#
+# Note: `build:` is not used by `docker stack deploy` — swarm only pulls
+# pre-built images, it doesn't build them. Build/pull the `lastmile` image on
+# each node first (or push it to a registry all nodes can pull from).
+
+x-robot: &robot
+  image: lastmile
+  networks:
+    - robot-net
+  deploy:
+    replicas: 1
+    restart_policy:
+      condition: any
+
+services:
+  robot1:
+    <<: *robot
+    environment:
+      ROBOT_ID: robot1
+      PEERS: robot2,robot3,robot4,robot5
+    ports:
+      - "8001:8000"
+
+  robot2:
+    <<: *robot
+    environment:
+      ROBOT_ID: robot2
+      PEERS: robot1,robot3,robot4,robot5
+    ports:
+      - "8002:8000"
+
+  robot3:
+    <<: *robot
+    environment:
+      ROBOT_ID: robot3
+      PEERS: robot1,robot2,robot4,robot5
+    ports:
+      - "8003:8000"
+
+  robot4:
+    <<: *robot
+    environment:
+      ROBOT_ID: robot4
+      PEERS: robot1,robot2,robot3,robot5
+    ports:
+      - "8004:8000"
+
+  robot5:
+    <<: *robot
+    environment:
+      ROBOT_ID: robot5
+      PEERS: robot1,robot2,robot3,robot4
+    ports:
+      - "8005:8000"
+
+networks:
+  robot-net:
+    driver: overlay
+    attachable: true
