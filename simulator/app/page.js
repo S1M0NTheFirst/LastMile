@@ -111,7 +111,11 @@ export default function Page() {
                   }}
                 />
               </div>
-              <div className="hint">battery {Math.round(bat)}% · port {r.hostPort || "—"}</div>
+              <div className="hint">
+                battery {Math.round(bat)}% · port {r.hostPort || "—"}
+                <br />
+                mode: {r.state?.mode || "unknown"} · accepts tasks: {r.state?.accepting_tasks ? "yes" : "no"}
+              </div>
 
               <div className="row" style={{ marginTop: 10 }}>
                 <div className="btns">
@@ -153,6 +157,15 @@ export default function Page() {
                 >
                   drain
                 </button>
+              </div>
+
+              <div className="hint" style={{ marginTop: 10 }}>
+                <div>messages ({r.state?.inbox?.length || 0})</div>
+                {(r.state?.inbox || []).slice(-3).reverse().map((message, index) => (
+                  <div key={`${message.ts}-${index}`}>
+                    {message.from}: {message.body?.event || message.body?.msg || JSON.stringify(message.body)}
+                  </div>
+                ))}
               </div>
             </div>
           );
