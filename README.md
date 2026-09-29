@@ -68,95 +68,71 @@ curl localhost:8003/state
 A `503` means the target is `dead`/`no_response`; a name-resolution error means
 it is powered off.
 
-## Run across multiple machines (Docker Swarm)
+## Run across multiple machines (same network)
 
-`docker compose` only networks containers on one machine. To spread robots
-across multiple computers and still have them reach each other by name, join
-the machines into a **Docker Swarm** and deploy on its **overlay network**
-(an overlay network is routed between hosts, unlike the local `bridge`
-network `docker compose` uses).
+Each machine runs its own robots with `docker compose`. Robots on the same
+machine reach each other by container name; robots on the other machine are
+reached at that machine's **LAN IP + published port**. Works across macOS,
+Windows and Linux.
 
-**1. Pick one machine as the manager and initialize the swarm:**
+| Machine | Compose file                   | Robots        | Ports        |
+|---------|--------------------------------|---------------|--------------|
+| A       | `docker-compose.yml`           | robot1–robot5 | 8001–8005    |
+| B       | `docker-compose.machine-b.yml` | robot6–robot10| 8006–8010    |
+
+**1. Find each machine's LAN IP** (both must be on the same Wi-Fi/LAN):
 
 ```bash
-# on machine A — use the IP the other machine can reach it at
-docker swarm init --advertise-addr <machine-A-ip>
+ipconfig getifaddr en0    # macOS
+ipconfig                  # Windows (IPv4 Address)
+hostname -I               # Linux
 ```
 
-This prints a `docker swarm join --token ...` command.
-
-**2. Join the other machine(s) as workers:**
+**2. On each machine, create `.env`** from `.env.example` with the *other*
+machine's IP:
 
 ```bash
-# on machine B, paste the command machine A printed
-docker swarm join --token <token> <machine-A-ip>:2377
+cp .env.example .env
+# machine A: set MACHINE_B_IP=<B's IP>
+# machine B: set MACHINE_A_IP=<A's IP>
 ```
 
-Confirm both are in the cluster (run on the manager):
+**3. Start the robots:**
 
 ```bash
-docker node ls
+docker compose up --build -d                                  # machine A
+docker compose -f docker-compose.machine-b.yml up --build -d  # machine B
 ```
 
-**3. Build the robot image on every machine** (swarm doesn't build images,
-it only runs them — every node needs `lastmile` available locally, or you
-push it to a registry all nodes can pull from):
+Each machine builds its own `lastmile` image, so different CPU architectures
+(Apple Silicon vs. Intel/AMD) just work — no registry needed.
+
+**4. Show B's robots in the simulator** (on the machine running `npm run dev`):
 
 ```bash
-docker build -t lastmile ./robot
+cp simulator/.env.local.example simulator/.env.local
+# edit the IPs to machine B's IP, then restart `npm run dev`
 ```
 
-**4. Deploy the fleet as a stack** (from the manager only, even after more
-machines join later):
+Remote robots appear alongside local ones. Their status/battery controls work;
+On/Off is disabled because only the machine running a container can stop it.
+
+**5. Verify cross-machine messaging** (from machine A):
 
 ```bash
-docker stack deploy -c docker-stack.yml lastmile
-```
-
-`docker-stack.yml` defines **10 robots**, pinned by placement constraint:
-`robot1`–`robot5` to the manager node, `robot6`–`robot10` to a worker node.
-If you deploy before machine B has joined, `robot6`–`10` sit at `0/1`
-("pending", no node satisfies their constraint yet) — as soon as machine B
-joins as a worker, Swarm automatically schedules them there. No redeploy
-needed.
-
-**5. Verify:**
-
-```bash
-docker service ls                     # robot1-5 show 1/1, robot6-10 too once B has joined
-curl localhost:8001/state             # works from either machine
-
-# prove cross-machine messaging: pick two robots and check they can talk
+curl <B's IP>:8006/state                  # A can reach B
 curl -X POST localhost:8001/send \
   -H 'Content-Type: application/json' \
-  -d '{"to":"robot8","body":{"msg":"hello from another host"}}'
-curl localhost:8008/state             # message should be in the inbox
+  -d '{"to":"robot8","body":{"msg":"hello from machine A"}}'
+curl <B's IP>:8008/state                  # message is in robot8's inbox
 ```
 
-### Frontend: does it show all 10?
+**Troubleshooting**
 
-Yes — `simulator/` auto-detects swarm mode and switches from listing local
-containers to querying Swarm's service API, which is cluster-wide (the
-manager knows about every service and where it's scheduled, even if the
-container itself is running on machine B). Run `npm run dev` on the manager
-machine and open http://localhost:3000 — you'll see all 10 robots, correctly
-reflecting which are up vs. still pending a node. Naming stays simple no
-matter which physical machine each one lands on: always `robot1`…`robot10`.
-
-**Tear down:**
-
-```bash
-docker stack rm lastmile              # remove the fleet
-docker swarm leave --force            # on a worker, to leave the cluster
-docker swarm leave --force            # on the manager, to disband it (last)
-```
-
-### Why this works
-
-Docker Swarm gives every service a place in a cluster-wide DNS, backed by an
-overlay network (VXLAN tunnels between hosts). A container on machine B can
-resolve `robot1` and reach it exactly like `robot-net` in the single-machine
-setup, even though the container actually runs on machine A. Ports you
-publish (`8001:8000` etc.) are also reachable from **any** node's IP, not
-just the one running that container, via Swarm's routing mesh.
-
+- *Connection refused / timeout between machines:* allow the ports through the
+  firewall (Windows Defender Firewall inbound rule for 8001–8010; Linux
+  `sudo ufw allow 8001:8010/tcp`). Guest and campus Wi-Fi often block
+  device-to-device traffic — use a home router or phone hotspot.
+- *Robots stopped reaching each other after a reconnect:* LAN IPs can change.
+  Update `.env` and run `docker compose up -d` again (and `.env.local` for the
+  simulator), or reserve the IPs in your router.
