@@ -1,9 +1,9 @@
 """Single robot node.
 
-One image, run as N containers (robot1, robot2, ...). Each container is an
-isolated robot with controllable runtime state. Robots on the same machine
-talk over the shared Docker bridge network by container name; robots on other
-machines are reached at that machine's LAN IP + published port.
+One image, run as any number of containers on any number of machines. Each
+robot registers with a central registry (the simulator), which assigns its
+name first-come-first-served (robot0, robot1, ...) and tells robots where
+every other robot is reachable, so any robot can message any other.
 """
 import os
 import asyncio
@@ -14,30 +14,18 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# Identity comes from the environment so every container shares one image.
-ROBOT_ID = os.getenv("ROBOT_ID", "robot0")
-PORT = int(os.getenv("PORT", "8000"))
-# Comma-separated peers. A bare name is a container on this machine's bridge
-# network ("robot2" -> robot2:8000); "name=host:port" is a robot on another
-# machine, e.g. "robot6=192.168.1.50:8006".
-def _parse_peers(raw: str) -> dict[str, str]:
-    peers = {}
-    for entry in (p.strip() for p in raw.split(",")):
-        if not entry:
-            continue
-        name, _, addr = entry.partition("=")
-        peers[name.strip()] = addr.strip() or f"{name.strip()}:8000"
-    return peers
-
-
-PEERS = _parse_peers(os.getenv("PEERS", ""))
+# Registry address, e.g. "192.168.1.132:3000" (the machine running the simulator).
+REGISTRY = os.getenv("REGISTRY", "")
+# Where other machines can reach this robot: the host's LAN IP + published port.
+HOST_IP = os.getenv("HOST_IP", "")
+HOST_PORT = int(os.getenv("HOST_PORT", "0"))
 # Battery drains this many points per tick (1 tick/sec).
 DRAIN_RATE = float(os.getenv("DRAIN_RATE", "0.1"))
 
-app = FastAPI(title=f"Robot {ROBOT_ID}")
+app = FastAPI(title="Robot")
 
 state = {
-    "id": ROBOT_ID,
+    "id": None,             # assigned by the registry
     "power": "on",          # on | off  (off => container stopped, handled by orchestrator)
     "status": "alive",      # alive | dead | no_response
     "battery": 100.0,       # 0-100
@@ -61,9 +49,37 @@ async def _battery_loop():
                 state["status"] = "dead"
 
 
+async def _register_loop():
+    """Register until we get a name, then keep re-registering as a heartbeat.
+
+    Sending our current name lets us keep it if the registry restarts.
+    """
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        while True:
+            try:
+                r = await client.post(
+                    f"http://{REGISTRY}/api/registry",
+                    json={"host": HOST_IP, "port": HOST_PORT, "name": state["id"]},
+                )
+                r.raise_for_status()
+                state["id"] = r.json()["name"]
+            except (httpx.HTTPError, KeyError, ValueError):
+                pass  # registry not up yet; keep trying
+            await asyncio.sleep(3 if state["id"] else 1)
+
+
+async def _registry_robots() -> list[dict]:
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        r = await client.get(f"http://{REGISTRY}/api/registry")
+        return r.json()["robots"]
+
+
 @app.on_event("startup")
 async def _startup():
+    if not (REGISTRY and HOST_IP and HOST_PORT):
+        raise RuntimeError("REGISTRY, HOST_IP and HOST_PORT must be set (use join.py)")
     asyncio.create_task(_battery_loop())
+    asyncio.create_task(_register_loop())
 
 
 # ---- observability ----------------------------------------------------------
@@ -76,8 +92,8 @@ def get_state():
 @app.get("/heartbeat")
 def heartbeat():
     if not _responsive():
-        raise HTTPException(status_code=503, detail=f"{ROBOT_ID} not responsive")
-    return {"id": ROBOT_ID, "ts": time.time(), "battery": state["battery"]}
+        raise HTTPException(status_code=503, detail=f"{state['id']} not responsive")
+    return {"id": state["id"], "ts": time.time(), "battery": state["battery"]}
 
 
 # ---- inter-robot messaging --------------------------------------------------
@@ -90,36 +106,44 @@ class Message(BaseModel):
 @app.post("/message")
 def receive(msg: Message):
     if not _responsive():
-        raise HTTPException(status_code=503, detail=f"{ROBOT_ID} dropped message")
+        raise HTTPException(status_code=503, detail=f"{state['id']} dropped message")
     entry = {"from": msg.sender, "body": msg.body, "ts": time.time()}
     state["inbox"].append(entry)
     return {"accepted": True}
 
 
 class SendRequest(BaseModel):
-    to: str            # peer name from PEERS, or a raw host[:port]
+    to: str            # robot name, e.g. "robot23"
     body: dict
 
 
 @app.post("/send")
 async def send(req: SendRequest):
     if not _responsive():
-        raise HTTPException(status_code=503, detail=f"{ROBOT_ID} not responsive")
-    addr = PEERS.get(req.to, req.to)
-    if ":" not in addr:
-        addr = f"{addr}:8000"
-    url = f"http://{addr}/message"
+        raise HTTPException(status_code=503, detail=f"{state['id']} not responsive")
+    try:
+        robots = await _registry_robots()
+    except (httpx.HTTPError, KeyError, ValueError) as e:
+        return {"delivered": False, "error": f"registry unreachable: {e}"}
+    peer = next((r for r in robots if r["name"] == req.to), None)
+    if not peer:
+        return {"delivered": False, "error": f"unknown robot {req.to}"}
+    url = f"http://{peer['host']}:{peer['port']}/message"
     async with httpx.AsyncClient(timeout=3.0) as client:
         try:
-            r = await client.post(url, json={"sender": ROBOT_ID, "body": req.body})
+            r = await client.post(url, json={"sender": state["id"], "body": req.body})
             return {"delivered": r.status_code == 200, "peer_status": r.status_code}
         except httpx.HTTPError as e:
             return {"delivered": False, "error": str(e)}
 
 
 @app.get("/peers")
-def peers():
-    return {"peers": PEERS}
+async def peers():
+    try:
+        robots = await _registry_robots()
+    except (httpx.HTTPError, KeyError, ValueError) as e:
+        raise HTTPException(status_code=502, detail=f"registry unreachable: {e}")
+    return {"peers": [r for r in robots if r["name"] != state["id"]]}
 
 
 # ---- control (used by orchestrator / frontend) ------------------------------

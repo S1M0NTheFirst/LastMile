@@ -1,7 +1,7 @@
 import { findRobot } from "../../../../lib/fleet";
 
-// Proxy status/battery control to the robot itself, whether it's a container
-// on this machine or a robot on another machine (REMOTE_ROBOTS).
+// Proxy status/battery control to the robot itself, on whichever machine it
+// runs (its address comes from the registry).
 export async function POST(req, { params }) {
   const body = await req.json();
   const robot = await findRobot(params.name);

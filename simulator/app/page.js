@@ -111,7 +111,7 @@ export default function Page() {
                   }}
                 />
               </div>
-              <div className="hint">battery {Math.round(bat)}% · {r.remote ? "remote" : "port"} {r.hostPort || "—"}</div>
+              <div className="hint">battery {Math.round(bat)}% · {r.remote ? "remote" : "local"} {r.hostPort}</div>
 
               <div className="row" style={{ marginTop: 10 }}>
                 <div className="btns">

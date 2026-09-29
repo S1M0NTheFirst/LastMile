@@ -1,123 +1,81 @@
 import Docker from "dockerode";
+import { getRobot, listRobots } from "./registry";
 
-// Local robots are containers named `robot` + a number on this machine.
-// Remote robots run on other machines and are listed in REMOTE_ROBOTS as
-// "name=host:port" pairs, e.g. "robot6=192.168.1.50:8006,robot7=...".
-const ROBOT_RE = /^robot\d+$/;
+// Every robot, on any machine, is known through the registry. Robots whose
+// container runs on this machine's Docker can also be powered on/off.
 const docker = new Docker(); // local Docker socket
+const ONLINE_MS = 10_000; // no heartbeat for this long => robot is offline
 
-function remoteRobots() {
-  return (process.env.REMOTE_ROBOTS || "")
-    .split(",")
-    .map((e) => e.trim())
-    .filter(Boolean)
-    .map((e) => {
-      const [name, addr] = e.split("=").map((s) => s.trim());
-      return { name, addr };
-    })
-    .filter((r) => r.name && r.addr);
+function isFresh(robot) {
+  return Date.now() - robot.lastSeen < ONLINE_MS;
 }
 
-async function fetchState(base) {
-  const res = await fetch(`${base}/state`, {
-    signal: AbortSignal.timeout(1500),
-    cache: "no-store",
-  });
-  return res.json();
+// join.py labels each container with the host:port it registers under.
+async function localContainers() {
+  try {
+    const list = await docker.listContainers({
+      all: true,
+      filters: { label: ["lastmile.robot"] },
+    });
+    const byAddr = new Map();
+    for (const c of list) {
+      byAddr.set(`${c.Labels["lastmile.host"]}:${c.Labels["lastmile.port"]}`, c);
+    }
+    return byAddr;
+  } catch {
+    return new Map(); // Docker not running here; remote robots still show
+  }
 }
 
-// ---- local robots: containers on this machine ----
-
-function containerRobotName(c) {
-  return (c.Names?.[0] || "").replace(/^\//, "");
+function describe(robot, container) {
+  const running = container ? container.State === "running" : isFresh(robot);
+  return {
+    name: robot.name,
+    url: `http://${robot.host}:${robot.port}`,
+    hostPort: `${robot.host}:${robot.port}`,
+    remote: !container,
+    power: running ? "on" : "off",
+    container,
+  };
 }
 
-function containerPort(c) {
-  const p = (c.Ports || []).find((x) => x.PrivatePort === 8000 && x.PublicPort);
-  return p ? p.PublicPort : null;
-}
-
-export async function getContainer(name) {
-  const list = await docker.listContainers({ all: true });
-  const found = list.find((c) => containerRobotName(c) === name);
-  if (!found) return null;
-  return { info: found, handle: docker.getContainer(found.Id) };
-}
-
-async function getLocalFleet() {
-  const list = await docker.listContainers({ all: true });
+export async function getFleet() {
+  const containers = await localContainers();
   return Promise.all(
-    list
-      .filter((c) => ROBOT_RE.test(containerRobotName(c)))
-      .map(async (c) => {
-        const port = containerPort(c);
-        const running = c.State === "running";
-        const entry = {
-          name: containerRobotName(c),
-          power: running ? "on" : "off",
-          dockerStatus: c.State,
-          hostPort: port,
-          remote: false,
-          reachable: false,
-          state: null,
-        };
-        if (running && port) {
-          try {
-            entry.state = await fetchState(`http://localhost:${port}`);
-            entry.reachable = true;
-          } catch {
-            // dead / no_response robots won't answer
-          }
+    listRobots().map(async (robot) => {
+      const { container, ...entry } = describe(
+        robot,
+        containers.get(`${robot.host}:${robot.port}`)
+      );
+      entry.reachable = false;
+      entry.state = null;
+      if (entry.power === "on") {
+        try {
+          const res = await fetch(`${entry.url}/state`, {
+            signal: AbortSignal.timeout(1500),
+            cache: "no-store",
+          });
+          entry.state = await res.json();
+          entry.reachable = true;
+        } catch {
+          // dead / no_response robots won't answer
         }
-        return entry;
-      })
-  );
-}
-
-// ---- remote robots: on another machine, reached over the LAN ----
-
-async function getRemoteFleet() {
-  return Promise.all(
-    remoteRobots().map(async ({ name, addr }) => {
-      // We can't see the other machine's Docker, so an unreachable remote
-      // robot shows as powered-on but not answering.
-      const entry = {
-        name,
-        power: "on",
-        dockerStatus: "remote",
-        hostPort: addr,
-        remote: true,
-        reachable: false,
-        state: null,
-      };
-      try {
-        entry.state = await fetchState(`http://${addr}`);
-        entry.reachable = true;
-      } catch {
-        // offline, dead, or the other machine is unreachable
       }
+      delete entry.url;
       return entry;
     })
   );
 }
 
-export async function getFleet() {
-  const [local, remote] = await Promise.all([getLocalFleet(), getRemoteFleet()]);
-  return [...local, ...remote].sort((a, b) =>
-    a.name.localeCompare(b.name, undefined, { numeric: true })
-  );
-}
-
-// Finds a robot's base URL + whether it's powered on, local or remote.
+// Finds a robot's URL, whether it's on, and (if local) its container handle.
 export async function findRobot(name) {
-  const remote = remoteRobots().find((r) => r.name === name);
-  if (remote) return { url: `http://${remote.addr}`, running: true, remote: true };
-  const c = await getContainer(name);
-  if (!c) return null;
-  const port = containerPort(c.info);
+  const robot = getRobot(name);
+  if (!robot) return null;
+  const containers = await localContainers();
+  const { container, ...entry } = describe(robot, containers.get(`${robot.host}:${robot.port}`));
   return {
-    url: port ? `http://localhost:${port}` : null,
-    running: c.info.State === "running",
-    remote: false,
+    url: entry.url,
+    running: entry.power === "on",
+    handle: container ? docker.getContainer(container.Id) : null,
   };
 }

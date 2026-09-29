@@ -19,15 +19,21 @@ git clone https://github.com/S1M0NTheFirst/LastMile.git
 cd LastMile
 ```
 
+## How it works
+
+The simulator (Next.js app) is also the fleet's **registry**. Any machine on
+the same network can start any number of robots with `join.py`; each robot
+registers with the simulator, which names it first-come-first-served
+(`robot0`, `robot1`, ...), so names never clash across machines. The simulator
+shows every registered robot, and robots look each other up in the registry,
+so any robot can message any other, on any machine.
+
+Works across macOS, Windows and Linux. Each machine needs Docker and Python 3;
+the machine hosting the simulator also needs Node.js.
+
 ## Run the simulation
 
-**1. Start the 5-robot fleet** (builds one `lastmile` image, runs `robot1`–`robot5`):
-
-```bash
-docker compose up --build -d
-```
-
-**2. Start the web app** in a second terminal:
+**1. Start the simulator** on one machine (the "registry machine"):
 
 ```bash
 cd simulator
@@ -35,52 +41,7 @@ npm install      # first time only
 npm run dev
 ```
 
-**3. Open the simulator:** http://localhost:3000
-
-You'll see a map with a dot per robot and a control panel on the right to toggle
-power, set battery, and force `alive` / `no_response` / `dead` states.
-
-## Stop
-
-```bash
-# Ctrl+C in the simulator terminal to stop the web app
-docker compose down          # stop and remove the robot containers
-```
-
-## Poke the robots directly (optional)
-
-Each robot publishes its API on ports `8001`–`8005` (robot1 → 8001, etc.):
-
-```bash
-# view a robot's state
-curl localhost:8001/state
-
-# have robot1 message robot3 (delivered to robot3's inbox)
-curl -X POST localhost:8001/send \
-  -H 'Content-Type: application/json' \
-  -d '{"to":"robot3","body":{"msg":"hello"}}'
-
-# check robot3 received it
-curl localhost:8003/state
-```
-
-`delivered:true` means the robots can reach each other over the shared network.
-A `503` means the target is `dead`/`no_response`; a name-resolution error means
-it is powered off.
-
-## Run across multiple machines (same network)
-
-Each machine runs its own robots with `docker compose`. Robots on the same
-machine reach each other by container name; robots on the other machine are
-reached at that machine's **LAN IP + published port**. Works across macOS,
-Windows and Linux.
-
-| Machine | Compose file                   | Robots        | Ports        |
-|---------|--------------------------------|---------------|--------------|
-| A       | `docker-compose.yml`           | robot1–robot5 | 8001–8005    |
-| B       | `docker-compose.machine-b.yml` | robot6–robot10| 8006–8010    |
-
-**1. Find each machine's LAN IP** (both must be on the same Wi-Fi/LAN):
+Open http://localhost:3000. Note this machine's LAN IP:
 
 ```bash
 ipconfig getifaddr en0    # macOS
@@ -88,51 +49,55 @@ ipconfig                  # Windows (IPv4 Address)
 hostname -I               # Linux
 ```
 
-**2. On each machine, create `.env`** from `.env.example` with the *other*
-machine's IP:
+**2. Start robots on any machine**, including the registry machine
+(`<registry-ip>` is the IP from step 1):
 
 ```bash
-cp .env.example .env
-# machine A: set MACHINE_B_IP=<B's IP>
-# machine B: set MACHINE_A_IP=<A's IP>
+python join.py --registry <registry-ip>:3000 --count 20
 ```
 
-**3. Start the robots:**
+Run it again to add more; run it on as many machines as you like. Each run
+builds the `lastmile` image locally (so Apple Silicon and Intel/AMD machines
+both work) and picks free host ports starting at 8000.
+
+In the simulator you can set status/battery for every robot. On/Off works for
+robots on the registry machine; other machines' robots show as `remote` and
+are powered from their own machine (`python join.py --stop`).
+
+## Stop
 
 ```bash
-docker compose up --build -d                                  # machine A
-docker compose -f docker-compose.machine-b.yml up --build -d  # machine B
+python join.py --stop        # on each machine: remove its robots
+# Ctrl+C in the simulator terminal to stop the web app
 ```
 
-Each machine builds its own `lastmile` image, so different CPU architectures
-(Apple Silicon vs. Intel/AMD) just work — no registry needed.
+## Poke the robots directly (optional)
 
-**4. Show B's robots in the simulator** (on the machine running `npm run dev`):
-
-```bash
-cp simulator/.env.local.example simulator/.env.local
-# edit the IPs to machine B's IP, then restart `npm run dev`
-```
-
-Remote robots appear alongside local ones. Their status/battery controls work;
-On/Off is disabled because only the machine running a container can stop it.
-
-**5. Verify cross-machine messaging** (from machine A):
+Each robot's API is at `<machine-ip>:<port>` (shown in the simulator):
 
 ```bash
-curl <B's IP>:8006/state                  # A can reach B
-curl -X POST localhost:8001/send \
+curl localhost:8000/state
+
+# have that robot message robot3, wherever robot3 runs
+curl -X POST localhost:8000/send \
   -H 'Content-Type: application/json' \
-  -d '{"to":"robot8","body":{"msg":"hello from machine A"}}'
-curl <B's IP>:8008/state                  # message is in robot8's inbox
+  -d '{"to":"robot3","body":{"msg":"hello"}}'
+
+curl localhost:8000/peers    # every other robot and its address
 ```
 
-**Troubleshooting**
+`delivered:true` means the message reached robot3's inbox. A `503` means the
+target is `dead`/`no_response`; a connection error means it is powered off.
 
+## Troubleshooting
+
+- *Robots never appear in the simulator:* check the robot machine can reach
+  the registry: `curl <registry-ip>:3000/api/registry`.
 - *Connection refused / timeout between machines:* allow the ports through the
-  firewall (Windows Defender Firewall inbound rule for 8001–8010; Linux
-  `sudo ufw allow 8001:8010/tcp`). Guest and campus Wi-Fi often block
-  device-to-device traffic — use a home router or phone hotspot.
-- *Robots stopped reaching each other after a reconnect:* LAN IPs can change.
-  Update `.env` and run `docker compose up -d` again (and `.env.local` for the
-  simulator), or reserve the IPs in your router.
+  firewall (the simulator's 3000 and the robots' 8000+). Windows: add an
+  inbound Windows Defender Firewall rule; Linux: `sudo ufw allow 3000/tcp` and
+  `sudo ufw allow 8000:8100/tcp`. Guest and campus Wi-Fi often block
+  device-to-device traffic; use a home router or phone hotspot.
+- *A machine's IP changed:* run `python join.py --stop`, then join again.
+- *Simulator restarted:* running robots re-register within a few seconds and
+  keep their names.
