@@ -112,7 +112,7 @@ export default function Page() {
                 />
               </div>
               <div className="hint">
-                battery {Math.round(bat)}% · port {r.hostPort || "—"}
+                battery {Math.round(bat)}% · {r.remote ? "remote" : "local"} {r.hostPort || "—"}
                 <br />
                 mode: {r.state?.mode || "unknown"} · accepts tasks: {r.state?.accepting_tasks ? "yes" : "no"}
               </div>
@@ -120,12 +120,14 @@ export default function Page() {
               <div className="row" style={{ marginTop: 10 }}>
                 <div className="btns">
                   <button
+                    disabled={r.remote}
                     className={r.power === "on" ? "active" : ""}
                     onClick={() => act(() => post(`/api/robots/${r.name}/power`, { on: true }))}
                   >
                     On
                   </button>
                   <button
+                    disabled={r.remote}
                     className={r.power === "off" ? "active" : ""}
                     onClick={() => act(() => post(`/api/robots/${r.name}/power`, { on: false }))}
                   >

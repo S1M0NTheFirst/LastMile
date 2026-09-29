@@ -1,8 +1,9 @@
 """Single robot node.
 
-One image, run as N containers (robot1, robot2, ...). Each container is an
-isolated robot with controllable runtime state. Robots talk to each other
-directly over the shared Docker bridge network by container name.
+One image, run as any number of containers on any number of machines. Each
+robot registers with a central registry (the simulator), which assigns its
+name first-come-first-served (robot0, robot1, ...) and tells robots where
+every other robot is reachable, so any robot can message any other.
 """
 import os
 import asyncio
@@ -13,26 +14,19 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# Identity comes from the environment so every container shares one image.
-ROBOT_ID = os.getenv("ROBOT_ID", "robot0")
-PORT = int(os.getenv("PORT", "8000"))
-# Comma-separated list of peer hostnames, e.g. "robot1,robot2,robot3".
-PEERS = [p.strip() for p in os.getenv("PEERS", "").split(",") if p.strip()]
-# Optional cross-machine peer endpoints. Format:
-#   robot4=http://100.x.y.z:8004,robot5=http://100.x.y.z:8005
-PEER_URLS = {}
-for item in os.getenv("PEER_URLS", "").split(","):
-    if "=" in item:
-        name, url = item.split("=", 1)
-        PEER_URLS[name.strip()] = url.strip().rstrip("/")
+# Registry address, e.g. "192.168.1.132:3000" (the machine running the simulator).
+REGISTRY = os.getenv("REGISTRY", "")
+# Where other machines can reach this robot: the host's LAN IP + published port.
+HOST_IP = os.getenv("HOST_IP", "")
+HOST_PORT = int(os.getenv("HOST_PORT", "0"))
 # Battery drains this many points per tick (1 tick/sec).
 DRAIN_RATE = float(os.getenv("DRAIN_RATE", "0.1"))
 LOW_BATTERY_THRESHOLD = float(os.getenv("LOW_BATTERY_THRESHOLD", "15"))
 
-app = FastAPI(title=f"Robot {ROBOT_ID}")
+app = FastAPI(title="Robot")
 
 state = {
-    "id": ROBOT_ID,
+    "id": None,             # assigned by the registry
     "power": "on",          # on | off  (off => container stopped, handled by orchestrator)
     "status": "alive",      # alive | dead | no_response
     "mode": "available",    # available | returning_to_charge | unavailable
@@ -43,15 +37,46 @@ state = {
     "inbox": [],            # messages received from peers
 }
 low_battery_notified = False
-peer_health = {peer: None for peer in PEERS}
+# peer name -> last known healthy (True/False/None); None means not probed yet
+peer_health: dict[str, bool | None] = {}
 
 
-def responsive() -> bool:
+def _responsive() -> bool:
     """dead / no_response robots drop everything except control endpoints."""
     return state["status"] == "alive"
 
 
-async def battery_loop():
+async def _registry_robots() -> list[dict]:
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        r = await client.get(f"http://{REGISTRY}/api/registry")
+        return r.json()["robots"]
+
+
+async def notify_peers(event: str, details: dict):
+    """Send an automatic event to every other registered robot."""
+    if not state["id"]:
+        return
+    body = {"event": event, "robot": state["id"], **details}
+    try:
+        robots = await _registry_robots()
+    except (httpx.HTTPError, KeyError, ValueError):
+        return
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        for peer in robots:
+            if peer["name"] == state["id"]:
+                continue
+            try:
+                await client.post(
+                    f"http://{peer['host']}:{peer['port']}/message",
+                    json={"sender": state["id"], "body": body},
+                )
+            except httpx.HTTPError:
+                # A peer may be powered off or unreachable; the local robot
+                # continues operating and can retry through later policies.
+                pass
+
+
+async def _battery_loop():
     global low_battery_notified
     while True:
         await asyncio.sleep(1)
@@ -69,7 +94,7 @@ async def battery_loop():
                     {
                         "battery": state["battery"],
                         "action": "returning_to_charge",
-                        "message": f"{ROBOT_ID} battery is low",
+                        "message": f"{state['id']} battery is low",
                     },
                 )
             if state["battery"] == 0:
@@ -78,7 +103,7 @@ async def battery_loop():
                     {
                         "battery": 0,
                         "action": "unavailable",
-                        "message": f"{ROBOT_ID} battery is dead",
+                        "message": f"{state['id']} battery is dead",
                     },
                 )
                 state["status"] = "dead"
@@ -86,13 +111,28 @@ async def battery_loop():
                 state["accepting_tasks"] = False
 
 
-async def monitor_peers():
+async def _monitor_peers():
     """Detect peers that stop responding to heartbeat requests."""
     async with httpx.AsyncClient(timeout=2.0) as client:
         while True:
             await asyncio.sleep(3)
-            for peer in PEERS:
-                peer_base = PEER_URLS.get(peer, f"http://{peer}:8000")
+            if not state["id"]:
+                continue
+            try:
+                robots = await _registry_robots()
+            except (httpx.HTTPError, KeyError, ValueError):
+                continue
+
+            known = {r["name"] for r in robots if r["name"] != state["id"]}
+            for name in list(peer_health):
+                if name not in known:
+                    peer_health.pop(name, None)
+
+            for peer in robots:
+                name = peer["name"]
+                if name == state["id"]:
+                    continue
+                peer_base = f"http://{peer['host']}:{peer['port']}"
                 is_healthy = True
                 try:
                     response = await client.get(f"{peer_base}/heartbeat")
@@ -100,33 +140,55 @@ async def monitor_peers():
                 except httpx.HTTPError:
                     is_healthy = False
 
-                previous = peer_health[peer]
-                peer_health[peer] = is_healthy
+                previous = peer_health.get(name)
+                peer_health[name] = is_healthy
 
                 if previous is True and not is_healthy:
                     await notify_peers(
                         "peer_unresponsive",
                         {
-                            "peer": peer,
+                            "peer": name,
                             "action": "remove_from_task_assignment",
-                            "message": f"{peer} is no longer responding",
+                            "message": f"{name} is no longer responding",
                         },
                     )
 
 
+async def _register_loop():
+    """Register until we get a name, then keep re-registering as a heartbeat.
+
+    Sending our current name lets us keep it if the registry restarts.
+    """
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        while True:
+            try:
+                r = await client.post(
+                    f"http://{REGISTRY}/api/registry",
+                    json={"host": HOST_IP, "port": HOST_PORT, "name": state["id"]},
+                )
+                r.raise_for_status()
+                state["id"] = r.json()["name"]
+            except (httpx.HTTPError, KeyError, ValueError):
+                pass  # registry not up yet; keep trying
+            await asyncio.sleep(3 if state["id"] else 1)
+
+
 @app.on_event("startup")
-async def startup():
-    asyncio.create_task(battery_loop())
-    asyncio.create_task(monitor_peers())
+async def _startup():
+    if not (REGISTRY and HOST_IP and HOST_PORT):
+        raise RuntimeError("REGISTRY, HOST_IP and HOST_PORT must be set (use join.py)")
+    asyncio.create_task(_battery_loop())
+    asyncio.create_task(_register_loop())
+    asyncio.create_task(_monitor_peers())
 
 
 @app.on_event("shutdown")
-async def shutdown():
+async def _shutdown():
     await notify_peers(
         "robot_offline",
         {
             "action": "powered_off",
-            "message": f"{ROBOT_ID} is shutting down",
+            "message": f"{state['id']} is shutting down",
         },
     )
 
@@ -140,9 +202,9 @@ def get_state():
 
 @app.get("/heartbeat")
 def heartbeat():
-    if not responsive():
-        raise HTTPException(status_code=503, detail=f"{ROBOT_ID} not responsive")
-    return {"id": ROBOT_ID, "ts": time.time(), "battery": state["battery"]}
+    if not _responsive():
+        raise HTTPException(status_code=503, detail=f"{state['id']} not responsive")
+    return {"id": state["id"], "ts": time.time(), "battery": state["battery"]}
 
 
 # ---- inter-robot messaging --------------------------------------------------
@@ -154,52 +216,45 @@ class Message(BaseModel):
 
 @app.post("/message")
 def receive(msg: Message):
-    if not responsive():
-        raise HTTPException(status_code=503, detail=f"{ROBOT_ID} dropped message")
+    if not _responsive():
+        raise HTTPException(status_code=503, detail=f"{state['id']} dropped message")
     entry = {"from": msg.sender, "body": msg.body, "ts": time.time()}
     state["inbox"].append(entry)
     return {"accepted": True}
 
 
-async def notify_peers(event: str, details: dict):
-    """Send an automatic event to every configured peer."""
-    body = {"event": event, "robot": ROBOT_ID, **details}
-    async with httpx.AsyncClient(timeout=3.0) as client:
-        for peer in PEERS:
-            peer_base = PEER_URLS.get(peer, f"http://{peer}:8000")
-            try:
-                await client.post(
-                    f"{peer_base}/message",
-                    json={"sender": ROBOT_ID, "body": body},
-                )
-            except httpx.HTTPError:
-                # A peer may be powered off or unreachable; the local robot
-                # continues operating and can retry through later policies.
-                pass
-
-
 class SendRequest(BaseModel):
-    to: str            # peer hostname (container name)
+    to: str            # robot name, e.g. "robot23"
     body: dict
 
 
 @app.post("/send")
 async def send(req: SendRequest):
-    if not responsive():
-        raise HTTPException(status_code=503, detail=f"{ROBOT_ID} not responsive")
-    peer_base = PEER_URLS.get(req.to, f"http://{req.to}:8000")
-    url = f"{peer_base}/message"
+    if not _responsive():
+        raise HTTPException(status_code=503, detail=f"{state['id']} not responsive")
+    try:
+        robots = await _registry_robots()
+    except (httpx.HTTPError, KeyError, ValueError) as e:
+        return {"delivered": False, "error": f"registry unreachable: {e}"}
+    peer = next((r for r in robots if r["name"] == req.to), None)
+    if not peer:
+        return {"delivered": False, "error": f"unknown robot {req.to}"}
+    url = f"http://{peer['host']}:{peer['port']}/message"
     async with httpx.AsyncClient(timeout=3.0) as client:
         try:
-            r = await client.post(url, json={"sender": ROBOT_ID, "body": req.body})
+            r = await client.post(url, json={"sender": state["id"], "body": req.body})
             return {"delivered": r.status_code == 200, "peer_status": r.status_code}
         except httpx.HTTPError as e:
             return {"delivered": False, "error": str(e)}
 
 
 @app.get("/peers")
-def peers():
-    return {"peers": PEERS}
+async def peers():
+    try:
+        robots = await _registry_robots()
+    except (httpx.HTTPError, KeyError, ValueError) as e:
+        raise HTTPException(status_code=502, detail=f"registry unreachable: {e}")
+    return {"peers": [r for r in robots if r["name"] != state["id"]]}
 
 
 # ---- control (used by orchestrator / frontend) ------------------------------
@@ -221,7 +276,7 @@ async def control(ctrl: Control):
                 {
                     "status": ctrl.status,
                     "action": "unavailable",
-                    "message": f"{ROBOT_ID} changed status to {ctrl.status}",
+                    "message": f"{state['id']} changed status to {ctrl.status}",
                 },
             )
         state["status"] = ctrl.status
