@@ -1,8 +1,9 @@
 """Single robot node.
 
 One image, run as N containers (robot1, robot2, ...). Each container is an
-isolated robot with controllable runtime state. Robots talk to each other
-directly over the shared Docker bridge network by container name.
+isolated robot with controllable runtime state. Robots on the same machine
+talk over the shared Docker bridge network by container name; robots on other
+machines are reached at that machine's LAN IP + published port.
 """
 import os
 import asyncio
@@ -16,8 +17,20 @@ from pydantic import BaseModel
 # Identity comes from the environment so every container shares one image.
 ROBOT_ID = os.getenv("ROBOT_ID", "robot0")
 PORT = int(os.getenv("PORT", "8000"))
-# Comma-separated list of peer hostnames, e.g. "robot1,robot2,robot3".
-PEERS = [p.strip() for p in os.getenv("PEERS", "").split(",") if p.strip()]
+# Comma-separated peers. A bare name is a container on this machine's bridge
+# network ("robot2" -> robot2:8000); "name=host:port" is a robot on another
+# machine, e.g. "robot6=192.168.1.50:8006".
+def _parse_peers(raw: str) -> dict[str, str]:
+    peers = {}
+    for entry in (p.strip() for p in raw.split(",")):
+        if not entry:
+            continue
+        name, _, addr = entry.partition("=")
+        peers[name.strip()] = addr.strip() or f"{name.strip()}:8000"
+    return peers
+
+
+PEERS = _parse_peers(os.getenv("PEERS", ""))
 # Battery drains this many points per tick (1 tick/sec).
 DRAIN_RATE = float(os.getenv("DRAIN_RATE", "0.1"))
 
@@ -84,7 +97,7 @@ def receive(msg: Message):
 
 
 class SendRequest(BaseModel):
-    to: str            # peer hostname (container name)
+    to: str            # peer name from PEERS, or a raw host[:port]
     body: dict
 
 
@@ -92,7 +105,10 @@ class SendRequest(BaseModel):
 async def send(req: SendRequest):
     if not _responsive():
         raise HTTPException(status_code=503, detail=f"{ROBOT_ID} not responsive")
-    url = f"http://{req.to}:8000/message"
+    addr = PEERS.get(req.to, req.to)
+    if ":" not in addr:
+        addr = f"{addr}:8000"
+    url = f"http://{addr}/message"
     async with httpx.AsyncClient(timeout=3.0) as client:
         try:
             r = await client.post(url, json={"sender": ROBOT_ID, "body": req.body})

@@ -1,14 +1,16 @@
-import { getContainer, isSwarmActive, setSwarmPower } from "../../../../lib/fleet";
+import { findRobot, getContainer } from "../../../../lib/fleet";
 
 export async function POST(req, { params }) {
   const { on } = await req.json();
 
-  if (await isSwarmActive()) {
-    // Power in swarm mode = scaling the service's replica count 0/1,
-    // since the robot may be running on a different physical machine.
-    const result = await setSwarmPower(params.name, on);
-    if (!result) return Response.json({ error: "not found" }, { status: 404 });
-    return Response.json(result);
+  // Power = starting/stopping the container, which only works for robots on
+  // this machine's Docker. Remote robots are powered from their own machine.
+  const robot = await findRobot(params.name);
+  if (robot?.remote) {
+    return Response.json(
+      { error: "remote robot: power it on/off from its own machine" },
+      { status: 409 }
+    );
   }
 
   const c = await getContainer(params.name);

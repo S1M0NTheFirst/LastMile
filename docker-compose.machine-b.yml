@@ -1,0 +1,66 @@
+# Machine B: robot6-10 from the same "lastmile" image.
+# Robots on this machine reach each other by container name; robot1-5 live on
+# machine A and are reached at MACHINE_A_IP + their published port (set it in
+# .env, see .env.example).
+#
+#   docker compose -f docker-compose.machine-b.yml up --build -d
+#
+# Robot ports are published as 8006..8010 so machine A can reach them.
+
+x-robot: &robot
+  image: lastmile
+  build: ./robot
+  networks:
+    - robot-net
+  restart: unless-stopped
+
+services:
+  robot6:
+    <<: *robot
+    container_name: robot6
+    environment:
+      ROBOT_ID: robot6
+      PEERS: robot7,robot8,robot9,robot10,robot1=${MACHINE_A_IP:-machine-a}:8001,robot2=${MACHINE_A_IP:-machine-a}:8002,robot3=${MACHINE_A_IP:-machine-a}:8003,robot4=${MACHINE_A_IP:-machine-a}:8004,robot5=${MACHINE_A_IP:-machine-a}:8005
+    ports:
+      - "8006:8000"
+
+  robot7:
+    <<: *robot
+    container_name: robot7
+    environment:
+      ROBOT_ID: robot7
+      PEERS: robot6,robot8,robot9,robot10,robot1=${MACHINE_A_IP:-machine-a}:8001,robot2=${MACHINE_A_IP:-machine-a}:8002,robot3=${MACHINE_A_IP:-machine-a}:8003,robot4=${MACHINE_A_IP:-machine-a}:8004,robot5=${MACHINE_A_IP:-machine-a}:8005
+    ports:
+      - "8007:8000"
+
+  robot8:
+    <<: *robot
+    container_name: robot8
+    environment:
+      ROBOT_ID: robot8
+      PEERS: robot6,robot7,robot9,robot10,robot1=${MACHINE_A_IP:-machine-a}:8001,robot2=${MACHINE_A_IP:-machine-a}:8002,robot3=${MACHINE_A_IP:-machine-a}:8003,robot4=${MACHINE_A_IP:-machine-a}:8004,robot5=${MACHINE_A_IP:-machine-a}:8005
+    ports:
+      - "8008:8000"
+
+  robot9:
+    <<: *robot
+    container_name: robot9
+    environment:
+      ROBOT_ID: robot9
+      PEERS: robot6,robot7,robot8,robot10,robot1=${MACHINE_A_IP:-machine-a}:8001,robot2=${MACHINE_A_IP:-machine-a}:8002,robot3=${MACHINE_A_IP:-machine-a}:8003,robot4=${MACHINE_A_IP:-machine-a}:8004,robot5=${MACHINE_A_IP:-machine-a}:8005
+    ports:
+      - "8009:8000"
+
+  robot10:
+    <<: *robot
+    container_name: robot10
+    environment:
+      ROBOT_ID: robot10
+      PEERS: robot6,robot7,robot8,robot9,robot1=${MACHINE_A_IP:-machine-a}:8001,robot2=${MACHINE_A_IP:-machine-a}:8002,robot3=${MACHINE_A_IP:-machine-a}:8003,robot4=${MACHINE_A_IP:-machine-a}:8004,robot5=${MACHINE_A_IP:-machine-a}:8005
+    ports:
+      - "8010:8000"
+
+networks:
+  robot-net:
+    name: robot-net
+    driver: bridge
