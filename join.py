@@ -14,6 +14,7 @@ import os
 import socket
 import subprocess
 import sys
+import urllib.request
 
 IMAGE = "lastmile"
 LABEL = "lastmile.robot"
@@ -67,7 +68,23 @@ def free_ports(start, count):
     return ports
 
 
+def check_registry(registry):
+    """Fail early if this machine can't reach the simulator's registry."""
+    url = f"http://{registry}/api/registry"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            r.read()
+    except OSError as e:
+        sys.exit(
+            f"Can't reach the registry at {url}\n  ({e})\n"
+            "Is the simulator (npm run dev) running there, and are both machines on a\n"
+            "network that allows device-to-device traffic? Campus/guest Wi-Fi often\n"
+            "blocks it; try a phone hotspot or Tailscale."
+        )
+
+
 def start(args):
+    check_registry(args.registry)
     registry_host = args.registry.rsplit(":", 1)[0]
     host_ip = args.host_ip or lan_ip_towards(registry_host)
 
@@ -88,7 +105,7 @@ def start(args):
             IMAGE,
             capture=True,
         )
-        print(f"started robot on {host_ip}:{port}")
+        print(f"started robot on {host_ip}:{port} (container lastmile-{port})")
 
     print(f"\n{args.count} robot(s) joining via registry {args.registry}. "
           f"Names appear in the simulator within a few seconds.")

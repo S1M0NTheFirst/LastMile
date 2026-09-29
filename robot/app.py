@@ -54,6 +54,7 @@ async def _register_loop():
 
     Sending our current name lets us keep it if the registry restarts.
     """
+    failing = False
     async with httpx.AsyncClient(timeout=3.0) as client:
         while True:
             try:
@@ -62,9 +63,17 @@ async def _register_loop():
                     json={"host": HOST_IP, "port": HOST_PORT, "name": state["id"]},
                 )
                 r.raise_for_status()
-                state["id"] = r.json()["name"]
-            except (httpx.HTTPError, KeyError, ValueError):
-                pass  # registry not up yet; keep trying
+                name = r.json()["name"]
+                if name != state["id"]:
+                    print(f"registered with {REGISTRY} as {name}", flush=True)
+                state["id"] = name
+                failing = False
+            except (httpx.HTTPError, KeyError, ValueError) as e:
+                # Keep retrying, but only log when registration starts failing
+                # so `docker logs` shows why a robot never appears.
+                if not failing:
+                    print(f"can't register with {REGISTRY}: {e!r}; retrying", flush=True)
+                failing = True
             await asyncio.sleep(3 if state["id"] else 1)
 
 
