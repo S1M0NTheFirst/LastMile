@@ -1,0 +1,122 @@
+# Multi-machine fleet using Docker Swarm.
+# robot1-5 are pinned to the manager node, robot6-10 to a worker node, so
+# joining a second machine to the swarm and redeploying gives you a visibly
+# split 10-robot fleet (5 per machine) instead of an arbitrary scheduling.
+#
+# Usage (see README "Run across multiple machines" for the full walkthrough):
+#
+#   docker build -t lastmile ./robot          # build on EVERY node (or push to a registry)
+#   docker stack deploy -c docker-stack.yml lastmile
+#
+# Note: `build:` is not used by `docker stack deploy` — swarm only pulls
+# pre-built images, it doesn't build them.
+
+x-robot-manager: &robot-manager
+  image: lastmile
+  networks:
+    - robot-net
+  deploy:
+    replicas: 1
+    restart_policy:
+      condition: any
+    placement:
+      constraints:
+        - node.role == manager
+
+x-robot-worker: &robot-worker
+  image: lastmile
+  networks:
+    - robot-net
+  deploy:
+    replicas: 1
+    restart_policy:
+      condition: any
+    placement:
+      constraints:
+        - node.role == worker
+
+services:
+  robot1:
+    <<: *robot-manager
+    environment:
+      ROBOT_ID: robot1
+      PEERS: robot2,robot3,robot4,robot5,robot6,robot7,robot8,robot9,robot10
+    ports:
+      - "8001:8000"
+
+  robot2:
+    <<: *robot-manager
+    environment:
+      ROBOT_ID: robot2
+      PEERS: robot1,robot3,robot4,robot5,robot6,robot7,robot8,robot9,robot10
+    ports:
+      - "8002:8000"
+
+  robot3:
+    <<: *robot-manager
+    environment:
+      ROBOT_ID: robot3
+      PEERS: robot1,robot2,robot4,robot5,robot6,robot7,robot8,robot9,robot10
+    ports:
+      - "8003:8000"
+
+  robot4:
+    <<: *robot-manager
+    environment:
+      ROBOT_ID: robot4
+      PEERS: robot1,robot2,robot3,robot5,robot6,robot7,robot8,robot9,robot10
+    ports:
+      - "8004:8000"
+
+  robot5:
+    <<: *robot-manager
+    environment:
+      ROBOT_ID: robot5
+      PEERS: robot1,robot2,robot3,robot4,robot6,robot7,robot8,robot9,robot10
+    ports:
+      - "8005:8000"
+
+  robot6:
+    <<: *robot-worker
+    environment:
+      ROBOT_ID: robot6
+      PEERS: robot1,robot2,robot3,robot4,robot5,robot7,robot8,robot9,robot10
+    ports:
+      - "8006:8000"
+
+  robot7:
+    <<: *robot-worker
+    environment:
+      ROBOT_ID: robot7
+      PEERS: robot1,robot2,robot3,robot4,robot5,robot6,robot8,robot9,robot10
+    ports:
+      - "8007:8000"
+
+  robot8:
+    <<: *robot-worker
+    environment:
+      ROBOT_ID: robot8
+      PEERS: robot1,robot2,robot3,robot4,robot5,robot6,robot7,robot9,robot10
+    ports:
+      - "8008:8000"
+
+  robot9:
+    <<: *robot-worker
+    environment:
+      ROBOT_ID: robot9
+      PEERS: robot1,robot2,robot3,robot4,robot5,robot6,robot7,robot8,robot10
+    ports:
+      - "8009:8000"
+
+  robot10:
+    <<: *robot-worker
+    environment:
+      ROBOT_ID: robot10
+      PEERS: robot1,robot2,robot3,robot4,robot5,robot6,robot7,robot8,robot9
+    ports:
+      - "8010:8000"
+
+networks:
+  robot-net:
+    driver: overlay
+    attachable: true
