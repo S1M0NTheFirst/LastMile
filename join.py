@@ -19,6 +19,7 @@ import urllib.request
 IMAGE = "lastmile"
 LABEL = "lastmile.robot"
 ROBOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "robot")
+ROBOT_AUTH_TOKEN = os.getenv("ROBOT_AUTH_TOKEN", "")
 
 
 def docker(*args, capture=False):
@@ -92,7 +93,7 @@ def start(args):
     docker("build", "-q", "-t", IMAGE, ROBOT_DIR, capture=True)
 
     for port in free_ports(args.port_start, args.count):
-        docker(
+        run_args = [
             "run", "-d", "--restart", "unless-stopped",
             "--name", f"lastmile-{port}",
             "-p", f"{port}:8000",
@@ -102,9 +103,11 @@ def start(args):
             "-e", f"REGISTRY={args.registry}",
             "-e", f"HOST_IP={host_ip}",
             "-e", f"HOST_PORT={port}",
-            IMAGE,
-            capture=True,
-        )
+        ]
+        if ROBOT_AUTH_TOKEN:
+            run_args += ["-e", f"ROBOT_AUTH_TOKEN={ROBOT_AUTH_TOKEN}"]
+        run_args += [IMAGE]
+        docker(*run_args, capture=True)
         print(f"started robot on {host_ip}:{port} (container lastmile-{port})")
 
     print(f"\n{args.count} robot(s) joining via registry {args.registry}. "

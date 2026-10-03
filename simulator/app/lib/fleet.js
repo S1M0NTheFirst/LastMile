@@ -29,9 +29,13 @@ async function localContainers() {
 
 function describe(robot, container) {
   const running = container ? container.State === "running" : isFresh(robot);
+  // On Docker Desktop, the host cannot always reach its own LAN IP from a
+  // local published container port. Use loopback for local containers while
+  // preserving the advertised LAN address for remote machines.
+  const localUrl = container ? `http://127.0.0.1:${robot.port}` : `http://${robot.host}:${robot.port}`;
   return {
     name: robot.name,
-    url: `http://${robot.host}:${robot.port}`,
+    url: localUrl,
     hostPort: `${robot.host}:${robot.port}`,
     remote: !container,
     power: running ? "on" : "off",
