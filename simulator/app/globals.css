@@ -15,6 +15,41 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: #
 .map-panel { flex: 1; min-width: 0; }
 .side { width: 340px; overflow-y: auto; }
 
+.task-console {
+  background: #171b22;
+  border: 1px solid #333a46;
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 16px;
+}
+
+textarea {
+  width: 100%;
+  resize: vertical;
+  background: #101319;
+  color: #e6e8eb;
+  border: 1px solid #333a46;
+  border-radius: 6px;
+  padding: 9px;
+  font: inherit;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+button.submit { width: 100%; background: #4f8cff; border-color: #4f8cff; }
+button.cancel { width: 100%; margin-top: 8px; border-color: #8c3f46; color: #ff9da3; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.task-message { color: #9fbaff; font-size: 12px; line-height: 1.4; }
+.task-error { color: #ff8b8b; font-size: 12px; line-height: 1.4; }
+.task-detail { border-top: 1px solid #262b34; padding-top: 8px; margin-top: 8px; font-size: 12px; }
+.task-detail .row { margin-bottom: 5px; }
+.task-detail code { color: #aab4c4; font-size: 10px; }
+.task-status { color: #9fbaff; }
+.task-status.completed { color: #3ddc84; }
+.task-status.failed, .task-status.cancelled { color: #ff6b6b; }
+.task-progress { height: 6px; background: #262b34; border-radius: 6px; overflow: hidden; margin-top: 8px; }
+.task-progress > div { height: 100%; background: #4f8cff; transition: width .3s ease; }
+
 .map {
   width: 100%;
   aspect-ratio: 1 / 1;

@@ -9,9 +9,10 @@ import os
 import asyncio
 import random
 import time
+from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 # Registry address, e.g. "192.168.1.132:3000" (the machine running the simulator).
@@ -36,17 +37,19 @@ state = {
                  "y": round(random.uniform(0, 100), 1)},
     "inbox": [],            # messages received from peers
 }
+tasks: dict[str, dict] = {}
+task_workers: dict[str, asyncio.Task] = {}
 low_battery_notified = False
 # peer name -> last known healthy (True/False/None); None means not probed yet
 peer_health: dict[str, bool | None] = {}
 
 
-def _responsive() -> bool:
+def responsive() -> bool:
     """dead / no_response robots drop everything except control endpoints."""
     return state["status"] == "alive"
 
 
-async def _registry_robots() -> list[dict]:
+async def registry_robots() -> list[dict]:
     async with httpx.AsyncClient(timeout=3.0) as client:
         r = await client.get(f"http://{REGISTRY}/api/registry")
         return r.json()["robots"]
@@ -58,7 +61,7 @@ async def notify_peers(event: str, details: dict):
         return
     body = {"event": event, "robot": state["id"], **details}
     try:
-        robots = await _registry_robots()
+        robots = await registry_robots()
     except (httpx.HTTPError, KeyError, ValueError):
         return
     async with httpx.AsyncClient(timeout=3.0) as client:
@@ -76,7 +79,7 @@ async def notify_peers(event: str, details: dict):
                 pass
 
 
-async def _battery_loop():
+async def battery_loop():
     global low_battery_notified
     while True:
         await asyncio.sleep(1)
@@ -111,7 +114,7 @@ async def _battery_loop():
                 state["accepting_tasks"] = False
 
 
-async def _monitor_peers():
+async def monitor_peers():
     """Detect peers that stop responding to heartbeat requests."""
     async with httpx.AsyncClient(timeout=2.0) as client:
         while True:
@@ -119,7 +122,7 @@ async def _monitor_peers():
             if not state["id"]:
                 continue
             try:
-                robots = await _registry_robots()
+                robots = await registry_robots()
             except (httpx.HTTPError, KeyError, ValueError):
                 continue
 
@@ -154,7 +157,7 @@ async def _monitor_peers():
                     )
 
 
-async def _register_loop():
+async def register_loop():
     """Register until we get a name, then keep re-registering as a heartbeat.
 
     Sending our current name lets us keep it if the registry restarts.
@@ -174,16 +177,16 @@ async def _register_loop():
 
 
 @app.on_event("startup")
-async def _startup():
+async def startup():
     if not (REGISTRY and HOST_IP and HOST_PORT):
         raise RuntimeError("REGISTRY, HOST_IP and HOST_PORT must be set (use join.py)")
-    asyncio.create_task(_battery_loop())
-    asyncio.create_task(_register_loop())
-    asyncio.create_task(_monitor_peers())
+    asyncio.create_task(battery_loop())
+    asyncio.create_task(register_loop())
+    asyncio.create_task(monitor_peers())
 
 
 @app.on_event("shutdown")
-async def _shutdown():
+async def shutdown():
     await notify_peers(
         "robot_offline",
         {
@@ -202,7 +205,7 @@ def get_state():
 
 @app.get("/heartbeat")
 def heartbeat():
-    if not _responsive():
+    if not responsive():
         raise HTTPException(status_code=503, detail=f"{state['id']} not responsive")
     return {"id": state["id"], "ts": time.time(), "battery": state["battery"]}
 
@@ -216,7 +219,7 @@ class Message(BaseModel):
 
 @app.post("/message")
 def receive(msg: Message):
-    if not _responsive():
+    if not responsive():
         raise HTTPException(status_code=503, detail=f"{state['id']} dropped message")
     entry = {"from": msg.sender, "body": msg.body, "ts": time.time()}
     state["inbox"].append(entry)
@@ -230,10 +233,10 @@ class SendRequest(BaseModel):
 
 @app.post("/send")
 async def send(req: SendRequest):
-    if not _responsive():
+    if not responsive():
         raise HTTPException(status_code=503, detail=f"{state['id']} not responsive")
     try:
-        robots = await _registry_robots()
+        robots = await registry_robots()
     except (httpx.HTTPError, KeyError, ValueError) as e:
         return {"delivered": False, "error": f"registry unreachable: {e}"}
     peer = next((r for r in robots if r["name"] == req.to), None)
@@ -251,10 +254,156 @@ async def send(req: SendRequest):
 @app.get("/peers")
 async def peers():
     try:
-        robots = await _registry_robots()
+        robots = await registry_robots()
     except (httpx.HTTPError, KeyError, ValueError) as e:
         raise HTTPException(status_code=502, detail=f"registry unreachable: {e}")
     return {"peers": [r for r in robots if r["name"] != state["id"]]}
+
+
+# ---- task execution --------------------------------------------------------
+
+class TaskRequest(BaseModel):
+    task_id: str
+    type: str
+    payload: dict = {}
+
+
+class TaskCancel(BaseModel):
+    reason: str = "cancelled by orchestrator"
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def require_robot_token(authorization: str | None):
+    """Optional shared-secret protection for cross-machine task traffic."""
+    expected = os.getenv("ROBOT_AUTH_TOKEN", "")
+    if expected and authorization != f"Bearer {expected}":
+        raise HTTPException(status_code=401, detail="invalid robot token")
+
+
+async def run_task(task_id: str):
+    task = tasks[task_id]
+    task["status"] = "running"
+    task["started_at"] = now()
+    try:
+        if task["type"] in ("move_to", "deliver_package"):
+            if task["type"] == "deliver_package":
+                destination = task["payload"]["destination"]
+                x = float(destination["x"])
+                y = float(destination["y"])
+            else:
+                x = float(task["payload"]["x"])
+                y = float(task["payload"]["y"])
+            if not (0 <= x <= 100 and 0 <= y <= 100):
+                raise ValueError("x and y must be between 0 and 100")
+
+            start = dict(state["position"])
+            steps = 10
+            for step in range(1, steps + 1):
+                await asyncio.sleep(0.25)
+                if task["status"] == "cancelled":
+                    return
+                state["position"] = {
+                    "x": round(start["x"] + (x - start["x"]) * step / steps, 1),
+                    "y": round(start["y"] + (y - start["y"]) * step / steps, 1),
+                }
+                task["progress"] = round(step / steps, 2)
+
+            task["result"] = {"final_position": state["position"]}
+            if task["type"] == "deliver_package":
+                task["result"]["delivered"] = True
+                task["result"]["package_id"] = task["payload"]["package_id"]
+        elif task["type"] == "report_status":
+            task["result"] = {"state": dict(state)}
+        else:
+            raise ValueError(f"unsupported task type: {task['type']}")
+
+        task["status"] = "completed"
+        task["completed_at"] = now()
+    except asyncio.CancelledError:
+        task["status"] = "cancelled"
+        task["error"] = "worker cancelled"
+        raise
+    except Exception as exc:
+        task["status"] = "failed"
+        task["error"] = str(exc)
+        task["completed_at"] = now()
+    finally:
+        task_workers.pop(task_id, None)
+
+
+@app.post("/tasks")
+async def create_task(
+    req: TaskRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_robot_token(authorization)
+    if not state["id"]:
+        raise HTTPException(status_code=503, detail="robot is not registered")
+    if state["status"] != "alive" or not state["accepting_tasks"]:
+        raise HTTPException(status_code=409, detail="robot is not accepting tasks")
+    if any(
+        worker and not worker.done()
+        for worker in task_workers.values()
+    ):
+        raise HTTPException(status_code=409, detail="robot already has an active task")
+    if req.task_id in tasks:
+        return tasks[req.task_id]
+    if req.type not in ("move_to", "deliver_package", "report_status"):
+        raise HTTPException(status_code=400, detail="unsupported task type")
+    if req.type == "move_to" and not {"x", "y"}.issubset(req.payload):
+        raise HTTPException(status_code=400, detail="move_to requires x and y")
+    if req.type == "deliver_package":
+        destination = req.payload.get("destination", {})
+        if not req.payload.get("package_id") or not {"x", "y"}.issubset(destination):
+            raise HTTPException(
+                status_code=400,
+                detail="deliver_package requires package_id and destination x,y",
+            )
+
+    task = {
+        "task_id": req.task_id,
+        "robot_id": state["id"],
+        "type": req.type,
+        "payload": req.payload,
+        "status": "acknowledged",
+        "progress": 0.0,
+        "created_at": now(),
+    }
+    tasks[req.task_id] = task
+    task_workers[req.task_id] = asyncio.create_task(run_task(req.task_id))
+    return task
+
+
+@app.get("/tasks/{task_id}")
+def get_task(task_id: str, authorization: str | None = Header(default=None)):
+    require_robot_token(authorization)
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    return task
+
+
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(
+    task_id: str,
+    req: TaskCancel | None = None,
+    authorization: str | None = Header(default=None),
+):
+    require_robot_token(authorization)
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task["status"] in ("completed", "failed", "cancelled"):
+        return task
+    task["status"] = "cancelled"
+    task["error"] = (req.reason if req else "cancelled by orchestrator")
+    worker = task_workers.get(task_id)
+    if worker:
+        worker.cancel()
+    return task
 
 
 # ---- control (used by orchestrator / frontend) ------------------------------

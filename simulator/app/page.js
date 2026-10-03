@@ -26,6 +26,11 @@ export default function Page() {
   const [robots, setRobots] = useState([]);
   const [selected, setSelected] = useState(null);
   const [error, setError] = useState(null);
+  const [goal, setGoal] = useState("");
+  const [task, setTask] = useState(null);
+  const [taskMessage, setTaskMessage] = useState("");
+  const [taskError, setTaskError] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
 
   async function refresh() {
     try {
@@ -46,6 +51,60 @@ export default function Page() {
     const id = setInterval(refresh, 2000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    if (!task?.task_id || ["completed", "failed", "cancelled", "reassigned"].includes(task.status)) return;
+    const id = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/orchestrator/tasks/${task.task_id}`, { cache: "no-store" });
+        if (res.ok) setTask(await res.json());
+      } catch {
+        // The task remains visible while the orchestrator is temporarily unavailable.
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [task?.task_id, task?.status]);
+
+  async function submitGoal(event) {
+    event.preventDefault();
+    if (!goal.trim() || submitting) return;
+    setSubmitting(true);
+    setTaskError(null);
+    setTaskMessage("");
+    try {
+      const res = await fetch("/api/orchestrator/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: goal.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || data.error || "Task request failed");
+      setTaskMessage(data.message || "Gemini processed the request.");
+      setTask(data.executed || null);
+      setGoal("");
+      refresh();
+    } catch (e) {
+      setTaskError(String(e.message || e));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function cancelCurrentTask() {
+    if (!task?.task_id) return;
+    try {
+      const res = await fetch(`/api/orchestrator/tasks/${task.task_id}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "cancelled from dashboard" }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || data.error || "Cancellation failed");
+      setTask(data);
+    } catch (e) {
+      setTaskError(String(e.message || e));
+    }
+  }
 
   async function act(fn) {
     await fn();
@@ -85,6 +144,48 @@ export default function Page() {
       </div>
 
       <div className="side">
+        <div className="task-console">
+          <h2>LLM Task Console</h2>
+          <form onSubmit={submitGoal}>
+            <textarea
+              value={goal}
+              onChange={(e) => setGoal(e.target.value)}
+              placeholder="Deliver package P123 to the north entrance"
+              rows={3}
+            />
+            <div className="hint task-locations">
+              Locations: north/east/west/south entrance · warehouse · main door
+            </div>
+            <button className="submit" disabled={submitting || !goal.trim()}>
+              {submitting ? "Thinking…" : "Send task"}
+            </button>
+          </form>
+          {taskError && <p className="task-error">{taskError}</p>}
+          {taskMessage && <p className="task-message">{taskMessage}</p>}
+          {task && (
+            <div className="task-detail">
+              <div className="row"><span>Task</span><code>{task.task_id}</code></div>
+              <div className="row"><span>Robot</span><strong>{task.robot_id}</strong></div>
+              {task.type === "deliver_package" && (
+                <>
+                  <div className="row"><span>Package</span><strong>{task.payload?.package_id}</strong></div>
+                  <div className="row"><span>Destination</span><strong>{task.destination?.name || task.payload?.destination?.name}</strong></div>
+                </>
+              )}
+              <div className="row"><span>Status</span><span className={`task-status ${task.status}`}>{task.status}</span></div>
+              <div className="task-progress"><div style={{ width: `${Math.round((task.progress || 0) * 100)}%` }} /></div>
+              {!["completed", "failed", "cancelled", "reassigned"].includes(task.status) && (
+                <button className="cancel" onClick={cancelCurrentTask}>Cancel task</button>
+              )}
+              {task.replacement_task_id && (
+                <div className="hint" style={{ marginTop: 6 }}>
+                  reassigned to {task.replacement_robot_id} · {task.replacement_task_id}
+                </div>
+              )}
+              {task.error && <div className="task-error" style={{ marginTop: 6 }}>{task.error}</div>}
+            </div>
+          )}
+        </div>
         <h2>Fleet ({robots.length})</h2>
         {robots.map((r) => {
           const bat = r.state?.battery ?? 0;
