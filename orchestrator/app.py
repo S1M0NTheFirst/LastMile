@@ -120,6 +120,7 @@ async def assign_task(
     robot_id: str | None = None,
     excluded_robot_ids: set[str] | None = None,
     retry_count: int = 0,
+    allow_handoff: bool = True,
 ):
     if not (0 <= target_x <= 100 and 0 <= target_y <= 100):
         raise HTTPException(status_code=400, detail="x and y must be between 0 and 100")
@@ -164,16 +165,14 @@ async def assign_task(
                         f"{robot_id} battery is below the required "
                         f"{minimum_battery:g}%"
                     )
-            candidates = available
+            candidates = available if allow_handoff else []
     else:
         candidates = available
 
     if not candidates:
         if handoff_reason:
-            raise HTTPException(
-                status_code=409,
-                detail=f"{handoff_reason}; no other suitable robot is available",
-            )
+            fallback = "no other suitable robot is available" if allow_handoff else "this task is not handed to another robot"
+            raise HTTPException(status_code=409, detail=f"{handoff_reason}; {fallback}")
         raise HTTPException(status_code=409, detail="no suitable robot is available")
 
     def selection_key(item):
@@ -219,6 +218,7 @@ async def assign_task(
                 raise HTTPException(status_code=502, detail=f"robot rejected task: {response.text}")
             task.update(response.json())
             task["status"] = "acknowledged"
+            task["deadline_epoch"] += float(task.get("estimated_seconds", 0))
             return task
     except httpx.HTTPError as exc:
         task["status"] = "failed"
@@ -275,6 +275,30 @@ async def assign_delivery_task(
     return task
 
 
+async def assign_drive_task(robot_id: str | None, steps, minimum_battery: float = 20):
+    """Simple motion (straight runs, turns) for one named robot; never handed off."""
+    if not robot_id:
+        raise HTTPException(status_code=400, detail="drive needs a robot_id")
+    if not isinstance(steps, list) or not steps:
+        raise HTTPException(status_code=400, detail="drive needs at least one step")
+    payload = {
+        "steps": [
+            {"action": str(dict(s).get("action", "")).lower(), "amount": float(dict(s).get("amount", 0))}
+            for s in steps
+        ]
+    }
+    # The robot validates the steps. The 50,50 target only ranks candidates,
+    # and without handoff the only candidate is robot_id.
+    return await assign_task("drive", payload, 50, 50, minimum_battery, robot_id, allow_handoff=False)
+
+
+def describe_steps(steps: list[dict]) -> str:
+    return ", ".join(
+        f"{s['action']} {s['amount']:g}{' m' if s['action'] in ('forward', 'backward') else '°'}"
+        for s in steps
+    )
+
+
 def gemini_tools():
     move_tool = types.FunctionDeclaration(
         name="assign_move_task",
@@ -310,7 +334,37 @@ def gemini_tools():
             "required": ["package_id", "destination"],
         },
     )
-    return [types.Tool(function_declarations=[move_tool, delivery_tool])]
+    drive_tool = types.FunctionDeclaration(
+        name="drive_robot",
+        description=(
+            "Drive one named robot with simple motion commands, run in order: "
+            "forward/backward move straight in meters, left/right turn in place in degrees. "
+            "Use for straight runs and turns, not for going to a map location."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "robot_id": {"type": "string", "description": "Robot to drive, such as robot3."},
+                "steps": {
+                    "type": "array",
+                    "description": "Motion commands, executed in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["forward", "backward", "left", "right"]},
+                            "amount": {
+                                "type": "number",
+                                "description": "Meters for forward/backward, degrees for left/right (max 360).",
+                            },
+                        },
+                        "required": ["action", "amount"],
+                    },
+                },
+            },
+            "required": ["robot_id", "steps"],
+        },
+    )
+    return [types.Tool(function_declarations=[move_tool, delivery_tool, drive_tool])]
 
 
 @app.get("/health")
@@ -349,6 +403,8 @@ async def direct_task(req: DirectTaskRequest):
             req.minimum_battery,
             req.robot_id,
         )
+    if req.type == "drive":
+        return await assign_drive_task(req.robot_id, req.payload.get("steps"), req.minimum_battery)
     raise HTTPException(status_code=400, detail="unsupported task type")
 
 
@@ -389,7 +445,8 @@ async def get_task(task_id: str):
 
 
 async def reassign_or_fail(task: dict, reason: str):
-    if task.get("retry_count", 0) >= task.get("max_retries", MAX_TASK_RETRIES):
+    # A drive is meant for one physical robot, so it is never moved to another.
+    if task["type"] == "drive" or task.get("retry_count", 0) >= task.get("max_retries", MAX_TASK_RETRIES):
         task["status"] = "failed"
         task["error"] = reason
         task["failed_at"] = now()
@@ -482,11 +539,15 @@ async def chat(req: ChatRequest):
     ]
     prompt = (
         "You control a simulated robot fleet. Use assign_move_task for a simple move "
-        "and assign_delivery_task when the user mentions delivering a package. Never "
+        "and assign_delivery_task when the user mentions delivering a package. Use "
+        "drive_robot when the user asks a robot to drive straight, back up, or turn "
+        "(for example 'robot3 go forward 1 meter then turn left'); a turn with no "
+        "angle means 90 degrees. drive_robot needs a named robot: if the user does not "
+        "say which robot to drive, ask instead of picking one. Never "
         "invent robot IDs and never issue HTTP or shell "
         "commands. If the requested robot is unavailable, hand the task to another "
         "available robot and explain the handoff. If the request is unrelated, "
-        "explain that only move and package-delivery tasks are currently supported. "
+        "explain that only move, drive, and package-delivery tasks are currently supported. "
         "Known locations include north entrance, east entrance, west entrance, "
         "south entrance, warehouse, and main door. The map uses "
         "x and y from 0 to 100; interpret top "
@@ -511,11 +572,13 @@ async def chat(req: ChatRequest):
         return {"message": response.text, "executed": None}
 
     call = calls[0]
-    if call.name not in ("assign_move_task", "assign_delivery_task"):
+    if call.name not in ("assign_move_task", "assign_delivery_task", "drive_robot"):
         raise HTTPException(status_code=400, detail=f"unsupported Gemini tool: {call.name}")
     args = dict(call.args or {})
     try:
-        if call.name == "assign_delivery_task":
+        if call.name == "drive_robot":
+            result = await assign_drive_task(args.get("robot_id"), args.get("steps"))
+        elif call.name == "assign_delivery_task":
             result = await assign_delivery_task(
                 str(args.get("package_id", "")),
                 str(args.get("destination", "")),
@@ -544,6 +607,8 @@ async def chat(req: ChatRequest):
                 f"Assigned {result['robot_id']} to deliver package "
                 f"{result['payload']['package_id']} to {result['destination']['name']}."
                 if result["type"] == "deliver_package"
+                else f"Driving {result['robot_id']}: {describe_steps(result['payload']['steps'])}."
+                if result["type"] == "drive"
                 else f"Assigned {result['robot_id']} to move to ({result['payload']['x']}, {result['payload']['y']})."
             )
         ),

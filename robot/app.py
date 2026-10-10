@@ -7,6 +7,7 @@ every other robot is reachable, so any robot can message any other.
 """
 import os
 import asyncio
+import math
 import random
 import time
 from datetime import datetime, timezone
@@ -14,6 +15,8 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
+
+import motors
 
 # Registry address, e.g. "192.168.1.132:3000" (the machine running the simulator).
 REGISTRY = os.getenv("REGISTRY", "")
@@ -23,6 +26,16 @@ HOST_PORT = int(os.getenv("HOST_PORT", "0"))
 # Battery drains this many points per tick (1 tick/sec).
 DRAIN_RATE = float(os.getenv("DRAIN_RATE", "0.1"))
 LOW_BATTERY_THRESHOLD = float(os.getenv("LOW_BATTERY_THRESHOLD", "15"))
+# Drive calibration: how fast the car goes at MOTOR_POWER throttle. Measure
+# these on the real car so "forward 1 m" and "left 90" come out right.
+DRIVE_SPEED = float(os.getenv("DRIVE_SPEED", "0.3"))   # meters per second
+TURN_SPEED = float(os.getenv("TURN_SPEED", "45"))      # degrees per second at full steering lock
+MOTOR_POWER = float(os.getenv("MOTOR_POWER", "0.3"))   # throttle 0-1 used for drive steps
+# Largest amount one drive step may ask for: degrees for turns, and meters for
+# straight runs only when MAX_DRIVE_METERS is set (no distance cap by default).
+MAX_DRIVE_METERS = float(os.getenv("MAX_DRIVE_METERS", "inf"))
+DRIVE_LIMITS = {"forward": MAX_DRIVE_METERS, "backward": MAX_DRIVE_METERS, "left": 360.0, "right": 360.0}
+METERS_PER_UNIT = 2.0  # the dashboard's 0-100 grid spans 200 m
 
 app = FastAPI(title="Robot")
 
@@ -35,6 +48,7 @@ state = {
     "battery": 100.0,       # 0-100
     "position": {"x": round(random.uniform(0, 100), 1),
                  "y": round(random.uniform(0, 100), 1)},
+    "heading": 90.0,        # degrees, counter-clockwise from east; 90 = facing north (+y)
     "inbox": [],            # messages received from peers
 }
 tasks: dict[str, dict] = {}
@@ -189,6 +203,7 @@ async def register_loop():
 async def startup():
     if not (REGISTRY and HOST_IP and HOST_PORT):
         raise RuntimeError("REGISTRY, HOST_IP and HOST_PORT must be set (use join.py)")
+    motors.check_driver()
     asyncio.create_task(battery_loop())
     asyncio.create_task(register_loop())
     asyncio.create_task(monitor_peers())
@@ -292,12 +307,83 @@ def require_robot_token(authorization: str | None):
         raise HTTPException(status_code=401, detail="invalid robot token")
 
 
+def parse_drive_steps(payload: dict) -> list[dict]:
+    """Validate a drive payload: {"steps": [{"action": "forward", "amount": 1.5}, ...]}."""
+    steps = payload.get("steps")
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 10:
+        raise ValueError("drive requires 1 to 10 steps")
+    clean = []
+    for step in steps:
+        action = str(step.get("action", "")).lower()
+        if action not in DRIVE_LIMITS:
+            raise ValueError(f"unknown drive action {action!r}; use {', '.join(DRIVE_LIMITS)}")
+        amount = float(step.get("amount", 0))
+        if not 0 < amount <= DRIVE_LIMITS[action]:
+            cap = "" if math.isinf(DRIVE_LIMITS[action]) else f" and at most {DRIVE_LIMITS[action]:g}"
+            raise ValueError(f"{action} amount must be above 0{cap}")
+        clean.append({"action": action, "amount": amount})
+    return clean
+
+
+def drive_seconds(steps: list[dict]) -> float:
+    return sum(
+        s["amount"] / (DRIVE_SPEED if s["action"] in ("forward", "backward") else TURN_SPEED)
+        for s in steps
+    )
+
+
+async def run_drive(task: dict) -> dict:
+    """Run drive steps in order on the car, mirroring the motion on the map.
+
+    The robot drives like a car (JetRacer): a turn is driving forward with the
+    wheels at full lock until the heading has changed by the requested angle,
+    so on the map it traces an arc rather than spinning in place.
+    """
+    steps = task["payload"]["steps"]
+    total = drive_seconds(steps)
+    elapsed = 0.0
+    try:
+        for step in steps:
+            straight = step["action"] in ("forward", "backward")
+            throttle = -MOTOR_POWER if step["action"] == "backward" else MOTOR_POWER
+            steering = {"left": -1.0, "right": 1.0}.get(step["action"], 0.0)
+            remaining = step["amount"] / (DRIVE_SPEED if straight else TURN_SPEED)
+            while remaining > 1e-6:  # float leftovers would add an extra ~0 s tick
+                if state["status"] != "alive":
+                    raise RuntimeError(f"robot became {state['status']} mid-drive")
+                # Re-sent every tick: the motor bridge stops the car when
+                # commands stop arriving.
+                motors.set_drive(throttle, steering)
+                dt = min(0.1, remaining)
+                await asyncio.sleep(dt)
+                remaining -= dt
+                elapsed += dt
+                state["heading"] = (state["heading"] - steering * TURN_SPEED * dt) % 360
+                d = math.copysign(DRIVE_SPEED * dt, throttle) / METERS_PER_UNIT
+                h = math.radians(state["heading"])
+                pos = state["position"]
+                state["position"] = {
+                    "x": round(min(100.0, max(0.0, pos["x"] + d * math.cos(h))), 3),
+                    "y": round(min(100.0, max(0.0, pos["y"] + d * math.sin(h))), 3),
+                }
+                task["progress"] = round(min(elapsed / total, 1.0), 2)
+    finally:
+        # Always stop the car, including on cancel or error.
+        try:
+            motors.set_drive(0, 0)
+        except RuntimeError:
+            pass  # bridge unreachable: its watchdog stops the car; keep the original error
+    return {"final_position": state["position"], "heading": round(state["heading"])}
+
+
 async def run_task(task_id: str):
     task = tasks[task_id]
     task["status"] = "running"
     task["started_at"] = now()
     try:
-        if task["type"] in ("move_to", "deliver_package"):
+        if task["type"] == "drive":
+            task["result"] = await run_drive(task)
+        elif task["type"] in ("move_to", "deliver_package"):
             if task["type"] == "deliver_package":
                 destination = task["payload"]["destination"]
                 x = float(destination["x"])
@@ -360,8 +446,13 @@ async def create_task(
         raise HTTPException(status_code=409, detail="robot already has an active task")
     if req.task_id in tasks:
         return tasks[req.task_id]
-    if req.type not in ("move_to", "deliver_package", "report_status"):
+    if req.type not in ("move_to", "deliver_package", "report_status", "drive"):
         raise HTTPException(status_code=400, detail="unsupported task type")
+    if req.type == "drive":
+        try:
+            req.payload = {"steps": parse_drive_steps(req.payload)}
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     if req.type == "move_to" and not {"x", "y"}.issubset(req.payload):
         raise HTTPException(status_code=400, detail="move_to requires x and y")
     if req.type == "deliver_package":
@@ -381,6 +472,9 @@ async def create_task(
         "progress": 0.0,
         "created_at": now(),
     }
+    if req.type == "drive":
+        # Lets the orchestrator extend its timeout for long drives.
+        task["estimated_seconds"] = round(drive_seconds(req.payload["steps"]), 1)
     tasks[req.task_id] = task
     task_workers[req.task_id] = asyncio.create_task(run_task(req.task_id))
     return task

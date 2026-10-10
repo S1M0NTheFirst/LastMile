@@ -26,7 +26,7 @@ def docker(*args, capture=False):
     result = subprocess.run(
         ["docker", *args],
         check=True,
-        text=True,
+        universal_newlines=True,  # same as text=True, which needs Python 3.7+ (Jetson Nano has 3.6)
         stdout=subprocess.PIPE if capture else None,
     )
     return result.stdout if capture else None
@@ -106,6 +106,12 @@ def start(args):
         ]
         if ROBOT_AUTH_TOKEN:
             run_args += ["-e", f"ROBOT_AUTH_TOKEN={ROBOT_AUTH_TOKEN}"]
+        if args.motor_driver:
+            run_args += ["-e", f"MOTOR_DRIVER={args.motor_driver}"]
+        # Drive calibration (see robot/app.py), passed through when set in the shell.
+        for name in ("DRIVE_SPEED", "TURN_SPEED", "MOTOR_POWER", "MAX_DRIVE_METERS"):
+            if os.getenv(name):
+                run_args += ["-e", f"{name}={os.getenv(name)}"]
         run_args += [IMAGE]
         docker(*run_args, capture=True)
         print(f"started robot on {host_ip}:{port} (container lastmile-{port})")
@@ -127,6 +133,7 @@ def main():
     p.add_argument("--count", type=int, default=5, help="robots to start (default 5)")
     p.add_argument("--host-ip", help="this machine's LAN IP (auto-detected if omitted)")
     p.add_argument("--port-start", type=int, default=8000, help="first host port to try (default 8000)")
+    p.add_argument("--motor-driver", help="drive the real car, e.g. jetracer (needs robot/motor_bridge.py running; default: map only)")
     p.add_argument("--stop", action="store_true", help="remove all robots on this machine")
     args = p.parse_args()
 
