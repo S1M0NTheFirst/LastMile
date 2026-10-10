@@ -104,3 +104,27 @@ body {
   font: bold 11px monospace; opacity: 0; transition: opacity .2s; pointer-events: none;
 }
 .toast.show { opacity: 1; }
+
+.legend-map { margin-top: 5px; color: #6f879a; }
+
+.world-note {
+  position: absolute; z-index: 4; bottom: 52px; left: 18px; max-width: 360px;
+  background: #071624ee; border: 1px solid #805e32; border-radius: 5px; padding: 8px 10px;
+  font: 10px monospace; line-height: 1.5; color: #ffc06b;
+}
+.world-note.info { border-color: #416a84; color: #8da8bd; }
+.view canvas { display: block; touch-action: none; }
+
+.zoom { display: flex; }
+.zoom .btn { border-radius: 0; min-width: 30px; font-size: 12px; padding: 6px 9px; }
+.zoom .btn:first-child { border-radius: 5px 0 0 5px; }
+.zoom .btn:last-child { border-radius: 0 5px 5px 0; }
+.zoom .btn + .btn { border-left: 0; }
+.zoom .zoom-level { min-width: 48px; font-size: 10px; }
+.card a { text-decoration: none; }
+.card a:hover { text-decoration: underline; }
+
+.seg { display: flex; }
+.seg .btn { padding: 5px 8px; border-radius: 0; }
+.seg .btn:first-child { border-radius: 4px 0 0 4px; }
+.seg .btn:last-child { border-radius: 0 4px 4px 0; border-left: 0; }
