@@ -1,9 +1,12 @@
 """LLM task gateway for the LastMile fleet.
 
-Gemini plans through one narrow tool (assign_move_task). This service validates
-the request, selects a healthy robot from the registry, and executes the task.
-The Gemini key never leaves this service.
+Gemini plans through narrow tools (assign_move_task, drive_robot, ...). This
+service validates the request, selects a healthy robot from the registry, and
+executes the task. It also runs camera autopilots: Gemini looks at a real car's
+camera, picks one small move, and repeats until the goal is reached. The Gemini
+key never leaves this service.
 """
+import asyncio
 import os
 import math
 import re
@@ -12,7 +15,7 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 
 try:
@@ -32,6 +35,11 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TASK_TIMEOUT_SECONDS = float(os.getenv("TASK_TIMEOUT_SECONDS", "15"))
 MAX_TASK_RETRIES = int(os.getenv("MAX_TASK_RETRIES", "1"))
+AUTOPILOT_MAX_STEPS = int(os.getenv("AUTOPILOT_MAX_STEPS", "20"))
+# Largest single autopilot move, so the car re-checks the camera often.
+AUTOPILOT_MAX_METERS = float(os.getenv("AUTOPILOT_MAX_METERS", "2.0"))
+AUTOPILOT_MAX_DEGREES = float(os.getenv("AUTOPILOT_MAX_DEGREES", "90"))
+FINAL_TASK_STATUSES = ("completed", "failed", "cancelled", "reassigned")
 KNOWN_LOCATIONS = {
     "north entrance": {"x": 90.0, "y": 90.0},
     "east entrance": {"x": 90.0, "y": 50.0},
@@ -48,6 +56,8 @@ LOCATION_ALIASES = {
     "front door": "main door",
 }
 tasks: dict[str, dict] = {}
+autopilots: dict[str, dict] = {}  # robot_id -> latest mission
+autopilot_workers: dict[str, asyncio.Task] = {}
 
 
 class ChatRequest(BaseModel):
@@ -63,6 +73,12 @@ class DirectTaskRequest(BaseModel):
 
 class CancelTaskRequest(BaseModel):
     reason: str = "cancelled by user"
+
+
+class AutopilotRequest(BaseModel):
+    robot_id: str
+    goal: str
+    max_steps: int = AUTOPILOT_MAX_STEPS
 
 
 def now():
@@ -160,6 +176,8 @@ async def assign_task(
                     handoff_reason = f"{robot_id} is {requested_state.get('status')}"
                 elif not requested_state.get("accepting_tasks"):
                     handoff_reason = f"{robot_id} is not accepting tasks"
+                elif robot_id in busy_robot_ids:
+                    handoff_reason = f"{robot_id} is busy with another task"
                 else:
                     handoff_reason = (
                         f"{robot_id} battery is below the required "
@@ -281,12 +299,13 @@ async def assign_drive_task(robot_id: str | None, steps, minimum_battery: float 
         raise HTTPException(status_code=400, detail="drive needs a robot_id")
     if not isinstance(steps, list) or not steps:
         raise HTTPException(status_code=400, detail="drive needs at least one step")
-    payload = {
-        "steps": [
-            {"action": str(dict(s).get("action", "")).lower(), "amount": float(dict(s).get("amount", 0))}
-            for s in steps
-        ]
-    }
+    payload = {"steps": []}
+    for s in steps:
+        s = dict(s)
+        step = {"action": str(s.get("action", "")).lower(), "amount": float(s.get("amount", 0))}
+        if s.get("speed"):
+            step["speed"] = float(s["speed"])  # the robot validates and caps it
+        payload["steps"].append(step)
     # The robot validates the steps. The 50,50 target only ranks candidates,
     # and without handoff the only candidate is robot_id.
     return await assign_task("drive", payload, 50, 50, minimum_battery, robot_id, allow_handoff=False)
@@ -295,8 +314,18 @@ async def assign_drive_task(robot_id: str | None, steps, minimum_battery: float 
 def describe_steps(steps: list[dict]) -> str:
     return ", ".join(
         f"{s['action']} {s['amount']:g}{' m' if s['action'] in ('forward', 'backward') else '°'}"
+        + (f" at speed {s['speed']:g}" if s.get("speed") else "")
         for s in steps
     )
+
+
+SPEED_PARAMETER = {
+    "type": "number",
+    "description": (
+        "Optional throttle from 0.1 to 1: 1 is full speed, 0.3 is normal. Only set it "
+        "when the user asks for a speed (fast, full speed, slowly)."
+    ),
+}
 
 
 def gemini_tools():
@@ -356,6 +385,7 @@ def gemini_tools():
                                 "type": "number",
                                 "description": "Meters for forward/backward, degrees for left/right (max 360).",
                             },
+                            "speed": SPEED_PARAMETER,
                         },
                         "required": ["action", "amount"],
                     },
@@ -364,7 +394,23 @@ def gemini_tools():
             "required": ["robot_id", "steps"],
         },
     )
-    return [types.Tool(function_declarations=[move_tool, delivery_tool, drive_tool])]
+    autopilot_tool = types.FunctionDeclaration(
+        name="start_autopilot",
+        description=(
+            "Let one named robot with a camera drive itself toward a visual goal, looking "
+            "through its camera after every small move (for example 'drive until you see "
+            "the door', 'find the red box', 'follow the hallway and stop at the wall')."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "robot_id": {"type": "string", "description": "Robot to drive, such as robot3."},
+                "goal": {"type": "string", "description": "What the robot should do, in plain words."},
+            },
+            "required": ["robot_id", "goal"],
+        },
+    )
+    return [types.Tool(function_declarations=[move_tool, delivery_tool, drive_tool, autopilot_tool])]
 
 
 @app.get("/health")
@@ -543,7 +589,10 @@ async def chat(req: ChatRequest):
         "drive_robot when the user asks a robot to drive straight, back up, or turn "
         "(for example 'robot3 go forward 1 meter then turn left'); a turn with no "
         "angle means 90 degrees. drive_robot needs a named robot: if the user does not "
-        "say which robot to drive, ask instead of picking one. Never "
+        "say which robot to drive, ask instead of picking one. Use start_autopilot "
+        "when the user wants a robot to react to what its camera sees (find, look for, "
+        "until you see, follow, avoid); only robots whose state has camera true can do "
+        "that. Never "
         "invent robot IDs and never issue HTTP or shell "
         "commands. If the requested robot is unavailable, hand the task to another "
         "available robot and explain the handoff. If the request is unrelated, "
@@ -572,9 +621,19 @@ async def chat(req: ChatRequest):
         return {"message": response.text, "executed": None}
 
     call = calls[0]
-    if call.name not in ("assign_move_task", "assign_delivery_task", "drive_robot"):
+    if call.name not in ("assign_move_task", "assign_delivery_task", "drive_robot", "start_autopilot"):
         raise HTTPException(status_code=400, detail=f"unsupported Gemini tool: {call.name}")
     args = dict(call.args or {})
+    if call.name == "start_autopilot":
+        mission = await start_autopilot(
+            AutopilotRequest(robot_id=str(args.get("robot_id", "")), goal=str(args.get("goal", "")))
+        )
+        return {
+            "message": f"{mission['robot_id']} autopilot started: {mission['goal']}",
+            "executed": None,
+            "autopilot": mission,
+            "gemini_tool": {"name": call.name, "arguments": args},
+        }
     try:
         if call.name == "drive_robot":
             result = await assign_drive_task(args.get("robot_id"), args.get("steps"))
@@ -615,3 +674,224 @@ async def chat(req: ChatRequest):
         "executed": result,
         "gemini_tool": {"name": call.name, "arguments": args},
     }
+
+
+# ---- camera + autopilot -----------------------------------------------------
+
+async def find_robot(robot_id: str) -> dict:
+    async with httpx.AsyncClient(timeout=3) as client:
+        response = await client.get(REGISTRY_URL)
+        response.raise_for_status()
+    robot = next((r for r in response.json().get("robots", []) if r["name"] == robot_id), None)
+    if not robot:
+        raise HTTPException(status_code=404, detail=f"{robot_id} is not registered")
+    return robot
+
+
+async def camera_frame(robot_id: str) -> bytes:
+    try:
+        robot = await find_robot(robot_id)
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.get(f"{robot_url(robot)}/camera", headers=robot_headers())
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"{robot_id} camera unreachable: {exc}")
+    if response.status_code != 200:
+        try:
+            detail = response.json().get("detail", response.text)
+        except ValueError:
+            detail = response.text
+        raise HTTPException(status_code=response.status_code, detail=detail)
+    return response.content
+
+
+@app.get("/robots/{robot_id}/camera")
+async def robot_camera(robot_id: str):
+    return Response(await camera_frame(robot_id), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+def autopilot_tools():
+    move_tool = types.FunctionDeclaration(
+        name="move",
+        description="Make one small move, then you will see a new camera image.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "observation": {"type": "string", "description": "What the camera shows, in one short sentence."},
+                "action": {"type": "string", "enum": ["forward", "backward", "left", "right"]},
+                "amount": {
+                    "type": "number",
+                    "description": (
+                        f"Meters for forward/backward (max {AUTOPILOT_MAX_METERS:g}), "
+                        f"degrees for left/right (max {AUTOPILOT_MAX_DEGREES:g})."
+                    ),
+                },
+                "speed": SPEED_PARAMETER,
+                "reason": {"type": "string", "description": "Why this move gets closer to the goal."},
+            },
+            "required": ["observation", "action", "amount", "reason"],
+        },
+    )
+    finish_tool = types.FunctionDeclaration(
+        name="finish",
+        description="Stop driving because the goal is reached, or it cannot be reached.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "observation": {"type": "string", "description": "What the camera shows, in one short sentence."},
+                "success": {"type": "boolean", "description": "True if the goal was reached."},
+                "summary": {"type": "string", "description": "One sentence for the user."},
+            },
+            "required": ["observation", "success", "summary"],
+        },
+    )
+    return [types.Tool(function_declarations=[move_tool, finish_tool])]
+
+
+def autopilot_prompt(mission: dict, step: int) -> str:
+    history = "\n".join(
+        f"{e['step']}. saw: {e['observation']} -> {e['action']} {e['amount']:g}"
+        + (f" at speed {e['speed']:g}" if e.get("speed") else "")
+        for e in mission["log"] if e.get("action")
+    ) or "none yet"
+    return (
+        "You drive a small robot car (a JetRacer) using the attached image from its "
+        f"front camera. Goal: {mission['goal']}\n\n"
+        "Each turn, call move for one small step, or finish when the goal is reached "
+        "or clearly impossible. The car steers like a car: left/right drive forward "
+        "along an arc at full lock, so a turn needs free space ahead; back up first if "
+        "something is close in front. Never drive forward into an obstacle closer than "
+        "about half a meter. Size each move by how much free space you see: short moves "
+        "(0.2 to 0.5 m, 15 to 45 degrees) near obstacles or when unsure, longer straight "
+        f"moves (up to {AUTOPILOT_MAX_METERS:g} m) when the path ahead is clearly open. "
+        "If the goal asks for a speed (full speed, fast, slowly), set speed on every "
+        "move to match: 1 is full speed, 0.3 is normal. The image is all you know "
+        "about the world.\n\n"
+        f"This is step {step} of at most {mission['max_steps']}.\n"
+        f"Moves so far:\n{history}"
+    )
+
+
+async def wait_for_drive(task_id: str) -> dict:
+    while True:
+        task = await get_task(task_id)
+        if task["status"] in FINAL_TASK_STATUSES:
+            return task
+        await asyncio.sleep(0.3)
+
+
+async def run_autopilot(mission: dict):
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    config = types.GenerateContentConfig(
+        tools=autopilot_tools(),
+        tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY")),
+    )
+    try:
+        for step in range(1, mission["max_steps"] + 1):
+            mission["step"] = step
+            mission["phase"] = "looking"
+            frame = await camera_frame(mission["robot_id"])
+            mission["phase"] = "thinking"
+            response = await client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=frame, mime_type="image/jpeg"),
+                    autopilot_prompt(mission, step),
+                ],
+                config=config,
+            )
+            calls = getattr(response, "function_calls", None) or []
+            if not calls:
+                raise RuntimeError(f"Gemini did not choose a move: {response.text}")
+            args = dict(calls[0].args or {})
+            entry = {"step": step, "observation": str(args.get("observation", "")), "ts": time.time()}
+            mission["log"].append(entry)
+
+            if calls[0].name == "finish":
+                entry["summary"] = str(args.get("summary", ""))
+                mission["status"] = "succeeded" if args.get("success") else "gave_up"
+                mission["summary"] = entry["summary"]
+                return
+
+            action = str(args.get("action", "")).lower()
+            limit = AUTOPILOT_MAX_METERS if action in ("forward", "backward") else AUTOPILOT_MAX_DEGREES
+            amount = round(min(max(float(args.get("amount", 0)), 0.05), limit), 2)
+            entry.update(action=action, amount=amount, reason=str(args.get("reason", "")))
+            move = {"action": action, "amount": amount}
+            if args.get("speed"):
+                move["speed"] = entry["speed"] = round(min(max(float(args["speed"]), 0.1), 1.0), 2)
+            mission["phase"] = "driving"
+            task = await assign_drive_task(mission["robot_id"], [move])
+            mission["task_id"] = task["task_id"]
+            task = await wait_for_drive(task["task_id"])
+            if task["status"] != "completed":
+                raise RuntimeError(f"drive {task['status']}: {task.get('error', '')}")
+        mission["status"] = "gave_up"
+        mission["summary"] = f"stopped after {mission['max_steps']} steps without finishing"
+    except asyncio.CancelledError:
+        mission["status"] = "stopped"
+        raise
+    except HTTPException as exc:
+        mission["status"] = "failed"
+        mission["summary"] = str(exc.detail)
+    except Exception as exc:
+        mission["status"] = "failed"
+        mission["summary"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        mission["phase"] = None
+        mission["finished_at"] = now()
+        autopilot_workers.pop(mission["robot_id"], None)
+
+
+@app.post("/autopilot")
+async def start_autopilot(req: AutopilotRequest):
+    if not GEMINI_API_KEY or genai is None:
+        raise HTTPException(status_code=503, detail="autopilot needs GEMINI_API_KEY and google-genai")
+    goal = req.goal.strip()
+    if not goal:
+        raise HTTPException(status_code=400, detail="autopilot needs a goal")
+    if req.robot_id in autopilot_workers:
+        raise HTTPException(status_code=409, detail=f"{req.robot_id} autopilot is already running")
+    await camera_frame(req.robot_id)  # fail now, not mid-mission, if there is no camera
+    mission = {
+        "robot_id": req.robot_id,
+        "goal": goal,
+        "max_steps": max(1, min(req.max_steps, 100)),
+        "status": "running",
+        "phase": None,
+        "step": 0,
+        "task_id": None,
+        "summary": None,
+        "log": [],
+        "started_at": now(),
+        "finished_at": None,
+    }
+    autopilots[req.robot_id] = mission
+    autopilot_workers[req.robot_id] = asyncio.create_task(run_autopilot(mission))
+    return mission
+
+
+@app.get("/autopilot")
+def list_autopilots():
+    return {"missions": list(autopilots.values())}
+
+
+@app.get("/autopilot/{robot_id}")
+def get_autopilot(robot_id: str):
+    mission = autopilots.get(robot_id)
+    if not mission:
+        raise HTTPException(status_code=404, detail=f"{robot_id} has no autopilot mission")
+    return mission
+
+
+@app.post("/autopilot/{robot_id}/stop")
+async def stop_autopilot(robot_id: str):
+    mission = get_autopilot(robot_id)
+    worker = autopilot_workers.get(robot_id)
+    if worker:
+        worker.cancel()
+    # Stop the car now rather than at the end of its current move.
+    if mission["task_id"] in tasks:
+        await cancel_task(mission["task_id"], CancelTaskRequest(reason="autopilot stopped"))
+    if mission["status"] == "running":
+        mission["status"] = "stopped"
+    return mission

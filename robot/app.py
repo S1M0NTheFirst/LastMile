@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Response
 from pydantic import BaseModel
 
 import motors
@@ -23,7 +23,8 @@ REGISTRY = os.getenv("REGISTRY", "")
 # Where other machines can reach this robot: the host's LAN IP + published port.
 HOST_IP = os.getenv("HOST_IP", "")
 HOST_PORT = int(os.getenv("HOST_PORT", "0"))
-# Battery drains this many points per tick (1 tick/sec).
+# Simulated robots drain this many battery points per tick (1 tick/sec); a
+# real car (MOTOR_DRIVER=jetracer) reports its measured battery instead.
 DRAIN_RATE = float(os.getenv("DRAIN_RATE", "0.1"))
 LOW_BATTERY_THRESHOLD = float(os.getenv("LOW_BATTERY_THRESHOLD", "15"))
 # Drive calibration: how fast the car goes at MOTOR_POWER throttle. Measure
@@ -31,6 +32,10 @@ LOW_BATTERY_THRESHOLD = float(os.getenv("LOW_BATTERY_THRESHOLD", "15"))
 DRIVE_SPEED = float(os.getenv("DRIVE_SPEED", "0.3"))   # meters per second
 TURN_SPEED = float(os.getenv("TURN_SPEED", "45"))      # degrees per second at full steering lock
 MOTOR_POWER = float(os.getenv("MOTOR_POWER", "0.3"))   # throttle 0-1 used for drive steps
+# A step may ask for its own throttle ("speed", 0-1, 1 = full speed), capped
+# here. DRIVE_SPEED and TURN_SPEED are measured at MOTOR_POWER and assumed to
+# scale with throttle, so distances are only approximate at other speeds.
+MAX_MOTOR_POWER = float(os.getenv("MAX_MOTOR_POWER", "1.0"))
 # Largest amount one drive step may ask for: degrees for turns, and meters for
 # straight runs only when MAX_DRIVE_METERS is set (no distance cap by default).
 MAX_DRIVE_METERS = float(os.getenv("MAX_DRIVE_METERS", "inf"))
@@ -46,6 +51,8 @@ state = {
     "mode": "available",    # available | returning_to_charge | unavailable
     "accepting_tasks": True,
     "battery": 100.0,       # 0-100
+    "battery_voltage": None,  # volts, real cars only
+    "camera": motors.DRIVER != "sim",  # real cars stream /camera
     "position": {"x": round(random.uniform(0, 100), 1),
                  "y": round(random.uniform(0, 100), 1)},
     "heading": 90.0,        # degrees, counter-clockwise from east; 90 = facing north (+y)
@@ -93,12 +100,33 @@ async def notify_peers(event: str, details: dict):
                 pass
 
 
+async def read_real_battery():
+    """Update the battery from the car's sensor; keeps the last value on failure."""
+    try:
+        reading = (await motors.bridge_get("/battery", timeout=2.0)).json()
+    except (RuntimeError, ValueError) as exc:
+        print(f"battery read failed: {exc}", flush=True)
+        return
+    state["battery"] = float(reading["percent"])
+    state["battery_voltage"] = reading["voltage"]
+
+
 async def battery_loop():
     global low_battery_notified
     while True:
         await asyncio.sleep(1)
         if state["status"] != "dead" and state["battery"] > 0:
-            state["battery"] = max(0.0, state["battery"] - DRAIN_RATE)
+            if motors.DRIVER == "sim":
+                state["battery"] = max(0.0, state["battery"] - DRAIN_RATE)
+            else:
+                await read_real_battery()
+                # Voltage sags while driving, so take tasks again once a
+                # rested battery reads comfortably above the threshold.
+                if low_battery_notified and state["battery"] > LOW_BATTERY_THRESHOLD + 5:
+                    low_battery_notified = False
+                    if state["mode"] == "returning_to_charge":
+                        state["mode"] = "available"
+                        state["accepting_tasks"] = True
             if (
                 not low_battery_notified
                 and 0 < state["battery"] < LOW_BATTERY_THRESHOLD
@@ -227,6 +255,19 @@ def get_state():
     return state
 
 
+@app.get("/camera")
+async def camera(authorization: str | None = Header(default=None)):
+    """Latest JPEG from the car's camera (real cars only)."""
+    require_robot_token(authorization)
+    if not state["camera"]:
+        raise HTTPException(status_code=404, detail=f"{state['id']} has no camera")
+    try:
+        frame = await motors.bridge_get("/camera.jpg")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return Response(frame.content, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
 @app.get("/heartbeat")
 def heartbeat():
     if not responsive():
@@ -308,7 +349,10 @@ def require_robot_token(authorization: str | None):
 
 
 def parse_drive_steps(payload: dict) -> list[dict]:
-    """Validate a drive payload: {"steps": [{"action": "forward", "amount": 1.5}, ...]}."""
+    """Validate a drive payload: {"steps": [{"action": "forward", "amount": 1.5, "speed": 0.5}, ...]}.
+
+    speed is optional and defaults to MOTOR_POWER.
+    """
     steps = payload.get("steps")
     if not isinstance(steps, list) or not 1 <= len(steps) <= 10:
         raise ValueError("drive requires 1 to 10 steps")
@@ -321,15 +365,21 @@ def parse_drive_steps(payload: dict) -> list[dict]:
         if not 0 < amount <= DRIVE_LIMITS[action]:
             cap = "" if math.isinf(DRIVE_LIMITS[action]) else f" and at most {DRIVE_LIMITS[action]:g}"
             raise ValueError(f"{action} amount must be above 0{cap}")
-        clean.append({"action": action, "amount": amount})
+        speed = float(step.get("speed") or MOTOR_POWER)
+        if not 0 < speed <= 1:
+            raise ValueError("speed must be above 0 and at most 1 (1 = full speed)")
+        clean.append({"action": action, "amount": amount, "speed": min(speed, MAX_MOTOR_POWER)})
     return clean
 
 
+def step_rate(step: dict) -> float:
+    """Meters (or degrees) per second for one step, scaled from the calibration."""
+    base = DRIVE_SPEED if step["action"] in ("forward", "backward") else TURN_SPEED
+    return base * step["speed"] / MOTOR_POWER
+
+
 def drive_seconds(steps: list[dict]) -> float:
-    return sum(
-        s["amount"] / (DRIVE_SPEED if s["action"] in ("forward", "backward") else TURN_SPEED)
-        for s in steps
-    )
+    return sum(s["amount"] / step_rate(s) for s in steps)
 
 
 async def run_drive(task: dict) -> dict:
@@ -344,10 +394,10 @@ async def run_drive(task: dict) -> dict:
     elapsed = 0.0
     try:
         for step in steps:
-            straight = step["action"] in ("forward", "backward")
-            throttle = -MOTOR_POWER if step["action"] == "backward" else MOTOR_POWER
+            throttle = -step["speed"] if step["action"] == "backward" else step["speed"]
             steering = {"left": -1.0, "right": 1.0}.get(step["action"], 0.0)
-            remaining = step["amount"] / (DRIVE_SPEED if straight else TURN_SPEED)
+            scale = step["speed"] / MOTOR_POWER  # map motion speeds up with the throttle
+            remaining = step["amount"] / step_rate(step)
             while remaining > 1e-6:  # float leftovers would add an extra ~0 s tick
                 if state["status"] != "alive":
                     raise RuntimeError(f"robot became {state['status']} mid-drive")
@@ -358,8 +408,8 @@ async def run_drive(task: dict) -> dict:
                 await asyncio.sleep(dt)
                 remaining -= dt
                 elapsed += dt
-                state["heading"] = (state["heading"] - steering * TURN_SPEED * dt) % 360
-                d = math.copysign(DRIVE_SPEED * dt, throttle) / METERS_PER_UNIT
+                state["heading"] = (state["heading"] - steering * TURN_SPEED * scale * dt) % 360
+                d = math.copysign(DRIVE_SPEED * scale * dt, throttle) / METERS_PER_UNIT
                 h = math.radians(state["heading"])
                 pos = state["position"]
                 state["position"] = {

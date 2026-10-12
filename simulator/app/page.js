@@ -1671,6 +1671,97 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
   }, [viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, onFloor]);
 }
 
+// Live camera and Gemini autopilot for a real car (robots whose state has camera: true).
+function RobotCamera({ name, onLog }) {
+  const [frame, setFrame] = useState(0);
+  const [camError, setCamError] = useState("");
+  const [mission, setMission] = useState(null);
+  const [goal, setGoal] = useState("");
+  const [busy, setBusy] = useState(false);
+  const alive = useRef(true);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => { alive.current = false; };
+  }, []);
+
+  // Ask for the next frame only once the last one arrived, so slow links don't pile up requests.
+  function nextFrame(delay) {
+    setTimeout(() => alive.current && setFrame((f) => f + 1), delay);
+  }
+
+  useEffect(() => {
+    async function poll() {
+      try {
+        const res = await fetch(`/api/orchestrator/autopilot/${name}`, { cache: "no-store" });
+        if (alive.current) setMission(res.ok ? await res.json() : null);
+      } catch {
+        // Orchestrator offline: the camera may still work.
+      }
+    }
+    poll();
+    const id = setInterval(poll, 1000);
+    return () => clearInterval(id);
+  }, [name]);
+
+  async function start(e) {
+    e.preventDefault();
+    if (!goal.trim() || busy) return;
+    setBusy(true);
+    try {
+      setMission(await post("/api/orchestrator/autopilot", { robot_id: name, goal: goal.trim() }));
+      onLog(`${name} autopilot started: ${goal.trim()}`);
+      setGoal("");
+    } catch (err) {
+      onLog(`${name} autopilot failed to start: ${err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stop() {
+    try {
+      setMission(await post(`/api/orchestrator/autopilot/${name}/stop`, {}));
+      onLog(`${name} autopilot stopped`);
+    } catch (err) {
+      onLog(`${name} autopilot stop failed: ${err.message}`);
+    }
+  }
+
+  const running = mission?.status === "running";
+  const last = mission?.log?.[mission.log.length - 1];
+  return (
+    <>
+      <div className="label" style={{ marginTop: 12 }}>CAMERA</div>
+      <div className="camera">
+        <img
+          src={`/api/orchestrator/robots/${name}/camera?f=${frame}`}
+          alt={`${name} camera`}
+          onLoad={() => { setCamError(""); nextFrame(200); }}
+          onError={() => { setCamError("camera unavailable, retrying…"); nextFrame(2000); }}
+        />
+        {camError && <div className="camera-error">{camError}</div>}
+      </div>
+
+      <div className="label" style={{ marginTop: 12 }}>AUTOPILOT {mission && <span className="muted">· {mission.status}{running && mission.phase ? ` · step ${mission.step} ${mission.phase}` : ""}</span>}</div>
+      <form onSubmit={start} className="autopilot-form">
+        <input className="textarea" value={goal} onChange={(e) => setGoal(e.target.value)}
+          placeholder="drive to the door and stop in front of it" disabled={running} />
+        {running
+          ? <button type="button" className="btn danger" onClick={stop}>STOP</button>
+          : <button className="btn" disabled={busy || !goal.trim()}>{busy ? "…" : "GO"}</button>}
+      </form>
+      {mission && (
+        <div className="msg muted">
+          {mission.goal}
+          {last && <div>saw: {last.observation}{last.action ? ` → ${last.action} ${last.amount}${["forward", "backward"].includes(last.action) ? " m" : "°"}${last.speed ? ` at speed ${last.speed}` : ""}` : ""}</div>}
+          {mission.summary && <div>{mission.summary}</div>}
+        </div>
+      )}
+    </>
+  );
+}
+
 export default function Page() {
   const [robots, setRobots] = useState([]);
   const [tasks, setTasks] = useState([]);
@@ -1795,6 +1886,20 @@ export default function Page() {
       if (res.ok) setTasks((await res.json()).tasks || []);
     } catch {
       // Orchestrator is optional; the fleet still renders without it.
+    }
+    try {
+      // Show each autopilot decision in the event stream, once each.
+      const res = await fetch("/api/orchestrator/autopilot", { cache: "no-store" });
+      for (const m of res.ok ? (await res.json()).missions || [] : []) {
+        for (const e of m.log) {
+          const key = `${m.robot_id}|${m.started_at}|${e.step}`;
+          if (seenMsgs.current.has(key)) continue;
+          seenMsgs.current.add(key);
+          log(`${m.robot_id} autopilot ${e.step}: ${e.observation}${e.action ? ` → ${e.action} ${e.amount}` : ` · ${e.summary}`}`);
+        }
+      }
+    } catch {
+      // Orchestrator is optional.
     }
   }
 
@@ -1942,7 +2047,7 @@ export default function Page() {
             onChange={(e) => setGoal(e.target.value)}
             placeholder="Deliver package P123 to the north entrance"
           />
-          <div className="sub" style={{ marginBottom: 6 }}>north/east/west/south entrance · warehouse · main door · try: robot3 forward 1 m, turn left</div>
+          <div className="sub" style={{ marginBottom: 6 }}>north/east/west/south entrance · warehouse · main door · try: robot3 forward 1 m, turn left · robot3 drive until you see a door</div>
           <button className="btn" disabled={submitting || !goal.trim()}>{submitting ? "THINKING…" : "SEND TASK"}</button>
           {missionTask && !FINAL.includes(missionTask.status) && (
             <button type="button" className="btn danger" style={{ marginLeft: 6 }} onClick={() => cancelTask(missionTask.task_id)}>
@@ -2107,7 +2212,7 @@ export default function Page() {
             </div>
             <div className="modal-grid">
               <div><small>STATUS</small><strong className={statusClass(robotStatus(sel))}>{robotStatus(sel).toUpperCase()}</strong></div>
-              <div><small>BATTERY</small><strong>{sel.state ? `${Math.round(sel.state.battery)}%` : "—"}</strong></div>
+              <div><small>BATTERY</small><strong>{sel.state ? `${Math.round(sel.state.battery)}%${sel.state.battery_voltage ? ` · ${sel.state.battery_voltage} V` : ""}` : "—"}</strong></div>
               <div><small>MODE</small><strong>{sel.state?.mode || "unknown"}</strong></div>
               <div><small>ACCEPTS TASKS</small><strong>{sel.state?.accepting_tasks ? "yes" : "no"}</strong></div>
               <div><small>POSITION</small><strong>{sel.state?.position ? `${sel.state.position.x.toFixed(1)}, ${sel.state.position.y.toFixed(1)}` : "—"}</strong></div>
@@ -2136,6 +2241,8 @@ export default function Page() {
                 onClick={() => act(`${sel.name} drained`, `/api/robots/${sel.name}/control`, { battery: 10 })}>DRAIN</button>
               <button className="btn" onClick={() => { setModalOpen(false); changeView("follow"); }}>FOLLOW</button>
             </div>
+
+            {sel.state?.camera && <RobotCamera key={sel.name} name={sel.name} onLog={(t) => { log(t); toast(t); }} />}
           </div>
         </div>
       )}

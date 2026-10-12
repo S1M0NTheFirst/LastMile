@@ -45,3 +45,25 @@ def set_drive(throttle: float, steering: float):
         raise RuntimeError(
             f"motor bridge at {BRIDGE_URL} failed ({exc!r}); is motor_bridge.py running on the Jetson?"
         ) from exc
+
+
+async def bridge_get(path: str, timeout: float = 6.0) -> httpx.Response:
+    """GET /battery or /camera.jpg from the bridge; RuntimeError when unavailable."""
+    if DRIVER == "sim":
+        raise RuntimeError("this robot has no hardware (MOTOR_DRIVER=sim)")
+    token = os.getenv("ROBOT_AUTH_TOKEN", "")
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                f"{BRIDGE_URL}{path}",
+                headers={"Authorization": f"Bearer {token}"} if token else {},
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"motor bridge at {BRIDGE_URL} unreachable ({exc!r})") from exc
+    if response.status_code != 200:
+        try:
+            detail = response.json().get("error", response.text)
+        except ValueError:
+            detail = response.text
+        raise RuntimeError(f"motor bridge {path}: {detail}")
+    return response

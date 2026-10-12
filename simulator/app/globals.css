@@ -96,6 +96,12 @@ body {
 .modal-grid div { background: #11283b; border-radius: 5px; padding: 9px; }
 .modal-grid small { display: block; color: #829bb0; font: 9px monospace; }
 .modal-grid strong { display: block; margin-top: 4px; font-size: 12px; }
+.modal { max-height: 92vh; overflow-y: auto; }
+.camera { position: relative; margin-top: 6px; background: #05101a; border-radius: 5px; aspect-ratio: 16 / 9; overflow: hidden; }
+.camera img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.camera-error { position: absolute; inset: 0; display: grid; place-items: center; color: #829bb0; font: 11px monospace; }
+.autopilot-form { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-top: 6px; }
+.autopilot-form .textarea { margin-bottom: 0; }
 .modal-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-top: 6px; }
 
 .toast {
