@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Response
 from pydantic import BaseModel
+from navigation import Navigator, FLOOR
 
 import motors
 
@@ -43,6 +44,7 @@ DRIVE_LIMITS = {"forward": MAX_DRIVE_METERS, "backward": MAX_DRIVE_METERS, "left
 METERS_PER_UNIT = 2.0  # the dashboard's 0-100 grid spans 200 m
 
 app = FastAPI(title="Robot")
+navigator = Navigator()
 
 state = {
     "id": None,             # assigned by the registry
@@ -57,6 +59,9 @@ state = {
                  "y": round(random.uniform(0, 100), 1)},
     "heading": 90.0,        # degrees, counter-clockwise from east; 90 = facing north (+y)
     "inbox": [],            # messages received from peers
+    "pose": navigator.pose, # authoritative floor-local meters and heading
+    "navigation": navigator.mission,
+    "floor_version": "measured-v1",
 }
 tasks: dict[str, dict] = {}
 task_workers: dict[str, asyncio.Task] = {}
@@ -199,6 +204,33 @@ async def monitor_peers():
                     )
 
 
+async def navigation_loop():
+    previous = time.monotonic()
+    was_navigating = False
+    while True:
+        await asyncio.sleep(0.05)
+        now = time.monotonic()
+        dt, previous = min(now - previous, 0.15), now
+        if responsive() and state["battery"] > 0:
+            navigator.tick(dt)
+        state["navigation"] = navigator.mission
+        navigating = bool(navigator.queue)
+        # Only take over mode/position while a floor route is active, so the
+        # battery and drive logic keep control the rest of the time.
+        if navigating:
+            state["mode"] = navigator.mission["phase"]
+            state["accepting_tasks"] = False
+            g = FLOOR["geometry"]
+            state["position"] = {
+                "x": (navigator.pose["v"] - g["leftEnd"]) / (g["rightEnd"] - g["leftEnd"]) * 100,
+                "y": (navigator.pose["u"] + 1) / (g["junctionFar"] + 1) * 100,
+            }
+        elif was_navigating and responsive() and not low_battery_notified:
+            state["mode"] = "available"
+            state["accepting_tasks"] = True
+        was_navigating = navigating
+
+
 async def register_loop():
     """Register until we get a name, then keep re-registering as a heartbeat.
 
@@ -235,6 +267,7 @@ async def startup():
     asyncio.create_task(battery_loop())
     asyncio.create_task(register_loop())
     asyncio.create_task(monitor_peers())
+    asyncio.create_task(navigation_loop())
 
 
 @app.on_event("shutdown")
@@ -592,4 +625,32 @@ async def control(ctrl: Control):
             if state["status"] == "alive":
                 state["mode"] = "available"
                 state["accepting_tasks"] = True
+        if state["battery"] == 0:
+            state["status"] = "dead"
+    return state
+
+
+class NavigationRequest(BaseModel):
+    door_id: str | None = None
+    cancel: bool = False
+
+
+@app.post("/navigate")
+async def navigate(req: NavigationRequest):
+    if req.cancel:
+        navigator.cancel()
+    else:
+        if not responsive() or state["battery"] <= 0:
+            raise HTTPException(status_code=409, detail="Recover and charge the robot before navigating")
+        if navigator.queue:
+            raise HTTPException(status_code=409, detail="Cancel the current route before choosing another door")
+        if not req.door_id:
+            raise HTTPException(status_code=400, detail="door_id is required")
+        try:
+            navigator.start(req.door_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Unknown door")
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+    state["navigation"] = navigator.mission
     return state

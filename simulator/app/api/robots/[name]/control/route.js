@@ -12,8 +12,9 @@ export async function POST(req, { params }) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
     });
-    return Response.json(await res.json());
+    return Response.json(await res.json(), { status: res.status });
   } catch (e) {
     return Response.json({ error: String(e) }, { status: 500 });
   }
