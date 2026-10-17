@@ -150,3 +150,74 @@ target is `dead`/`no_response`; a connection error means it is powered off.
 - *A machine's IP changed:* run `python3 join.py --stop`, then join again.
 - *Simulator restarted:* running robots re-register within a few seconds and
   keep their names.
+
+## Verify the measured-floor update
+
+The floor and the robot services share `robot/floor4.json`: 1 step = 0.50 m,
+1 tile = 0.25 m. The reference point is the hallway junction near room 418.
+Left/right wall sides are viewed walking **away from that junction**. Step
+counts are provisionally treated as hallway centerline distances; the final
+approach to a door is additional. Room dimensions and door widths are not surveyed.
+
+After pulling/editing this update, restart the dashboard and recreate existing
+robots so their containers include the navigation service. From the project root:
+
+```bash
+# Removes this project's existing robot containers on this machine.
+python3 join.py --stop
+cd simulator
+npm install
+npm run dev
+```
+
+In a second Terminal, with Docker Desktop running:
+
+```bash
+cd "/Users/ayushimistry/Desktop/AI UI prjct/LastMile"
+python3 join.py --registry "$(ipconfig getifaddr en0):3000" --count 3
+```
+
+If `en0` has no address, replace `$(ipconfig getifaddr en0)` with your active
+network IP. On macOS the dashboard also checks Docker Desktop's user socket,
+so local power controls do not require enabling the system-wide Docker socket.
+
+1. Open http://localhost:3000 and choose **OVERVIEW**. Zoom out with **−**
+   until it stops. The ground and perimeter should stay visible without fading
+   into fog. The external campus map may take time to download; the measured
+   floor works immediately even if that download fails.
+2. Choose **ECS 4F**. Door labels and the green **418 · JUNCTION · 0 m** marker
+   should appear. Use **ROOM LABELS** and **ROBOT LABELS** to toggle them.
+3. In **Measured room navigation**, select a robot and **416 · door A**.
+   Confirm **6 steps · 3.00 m · 12 tiles**, branch **left**, wall **right**.
+   Select **RETURN TO JUNCTION** first if you want every test to start at zero.
+4. Select **GO TO DOOR**. The camera follows the robot. Watch the phase change:
+   travelling → stopped at door → turning to door → approaching door → door touched.
+   The robot stops on the centerline before turning, then slowly brings its front
+   to the closed door. This is simulated geometric contact, not a physical sensor.
+5. While following, drag horizontally through a full circle, drag vertically
+   to adjust elevation, and scroll to zoom. Your orbit angle should stay stable
+   as the robot turns. **RESET BEHIND ROBOT** restores the default follow view.
+   Hallway surfaces that block the camera fade so the robot remains visible.
+6. Repeat with **408** (right/right, 5.00 m) and **402** (right/left, 7.25 m)
+   to verify opposite door-facing directions. Check **405 · door 2** at 30.00 m
+   and **413** at 27.75 m to verify both extended hallway ends.
+7. Start a long route, then **CANCEL ROUTE**. The pose should stop changing.
+   You can also inject **FAIL ROBOT** from its details: navigation pauses until
+   recovery. A robot with zero battery cannot navigate; charge and recover it.
+8. Select either bathroom: its distance remains listed, but **GO TO DOOR** is
+   disabled because branch and wall side still need confirmation. Both 416
+   entries are preserved. The close 412/414 and 407/405 door pairs have
+   explicitly provisional widths. **All measured entrances** lists all 22 entries.
+
+Automated checks (from the project root):
+
+```bash
+python3 -m unittest discover -s robot -p 'test_*.py' -v
+cd simulator
+npm run build
+```
+
+The navigation tests cover all 20 placed doors, unit conversion, heading and
+front-to-door contact, returning from a door, cancellation, and rejecting
+unplaced or unknown destinations. Measured navigation is independent of the
+unfinished LLM task console.

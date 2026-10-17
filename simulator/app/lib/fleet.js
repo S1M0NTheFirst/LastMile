@@ -1,9 +1,16 @@
 import Docker from "dockerode";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { getRobot, listRobots } from "./registry";
 
 // Every robot, on any machine, is known through the registry. Robots whose
 // container runs on this machine's Docker can also be powered on/off.
-const docker = new Docker(); // local Docker socket
+// Docker Desktop's user-level installation on macOS does not create /var/run/docker.sock.
+const userSocket = join(homedir(), ".docker", "run", "docker.sock");
+const docker = new Docker(!process.env.DOCKER_HOST && !existsSync("/var/run/docker.sock") && existsSync(userSocket)
+  ? { socketPath: userSocket }
+  : undefined);
 const ONLINE_MS = 10_000; // no heartbeat for this long => robot is offline
 
 function isFresh(robot) {

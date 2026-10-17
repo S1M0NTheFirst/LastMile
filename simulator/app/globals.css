@@ -128,3 +128,18 @@ body {
 .seg .btn { padding: 5px 8px; border-radius: 0; }
 .seg .btn:first-child { border-radius: 4px 0 0 4px; }
 .seg .btn:last-child { border-radius: 0 4px 4px 0; border-left: 0; }
+
+.door-select { width: 100%; margin: 7px 0; font-size: 11px; }
+.navigation-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+.door-directory { margin-top: 12px; font: 11px monospace; }
+.door-directory summary { cursor: pointer; color: #9bb1c2; margin-bottom: 7px; }
+.door-entry { display: flex; justify-content: space-between; gap: 8px; width: 100%; padding: 7px 4px; color: #d7e9f5; background: transparent; border: 0; border-bottom: 1px solid #233c50; text-align: left; font: 10px monospace; cursor: pointer; }
+.door-entry:hover, .door-entry.chosen { background: #19354a; color: #ffc06b; }
+@media (max-width: 900px) {
+  .top { left: 10px; right: 10px; }
+  .brand { font-size: 14px; }
+  .nav { max-width: 50%; }
+  .side { top: 150px; width: 300px; }
+  .mission { top: 150px; width: 250px; left: 10px; }
+  .app:has(.side) .mission { display: none; }
+}

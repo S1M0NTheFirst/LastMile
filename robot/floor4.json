@@ -1,0 +1,32 @@
+{
+  "stepMeters": 0.5,
+  "tileMeters": 0.25,
+  "measurementBasis": "hallway centerline; final door approach is additional",
+  "origin": "Hallway junction near room 418 (not a surveyed door position)",
+  "geometry": {"junctionNear": 7.09, "junctionFar": 8.75, "leftEnd": -28.5, "rightEnd": 30.75},
+  "robot": {"length": 0.62, "width": 0.46, "speed": 0.8, "turnSpeed": 1.4},
+  "doors": [
+    {"id":"bathroom-male","room":"Male bathroom","steps":6.5,"branch":null,"side":null,"note":"Branch and wall side need confirmation"},
+    {"id":"bathroom-female","room":"Female bathroom","steps":3.5,"branch":null,"side":null,"note":"Branch and wall side need confirmation"},
+    {"id":"416-a","room":"416","entry":"A","steps":6,"branch":"left","side":"right","note":"Repeated room number; kept as a separate entry"},
+    {"id":"411-1","room":"411","entry":"1","steps":17,"branch":"left","side":"left"},
+    {"id":"416-b","room":"416","entry":"B","steps":20.5,"branch":"left","side":"right","note":"Repeated room number; kept as a separate entry"},
+    {"id":"415a","room":"415A","steps":26,"branch":"left","side":"right"},
+    {"id":"411-2","room":"411","entry":"2","steps":34.5,"branch":"left","side":"left"},
+    {"id":"412-1","room":"412","entry":"1","steps":36.5,"branch":"left","side":"left","width":0.36,"note":"Close to 414; door width is provisional"},
+    {"id":"414","room":"414","steps":37.5,"branch":"left","side":"left","width":0.36,"note":"Close to 412 door 1; door width is provisional"},
+    {"id":"412-2","room":"412","entry":"2","steps":52.5,"branch":"left","side":"left"},
+    {"id":"413","room":"413","steps":55.5,"branch":"left","side":"left"},
+    {"id":"408","room":"408","steps":10,"branch":"right","side":"right"},
+    {"id":"402","room":"402","steps":14.5,"branch":"right","side":"left"},
+    {"id":"403-1","room":"403","entry":"1","steps":16.5,"branch":"right","side":"left"},
+    {"id":"407-1","room":"407","entry":"1","steps":22.5,"branch":"right","side":"right"},
+    {"id":"403-2","room":"403","entry":"2","steps":32.5,"branch":"right","side":"left"},
+    {"id":"404-1","room":"404","entry":"1","steps":36,"branch":"right","side":"left"},
+    {"id":"407-2","room":"407","entry":"2","steps":36.5,"branch":"right","side":"right","width":0.60,"note":"Door width is provisional near 405 door 1"},
+    {"id":"405-1","room":"405","entry":"1","steps":38,"branch":"right","side":"right","width":0.60,"note":"Door width is provisional near 407 door 2"},
+    {"id":"404-2","room":"404","entry":"2","steps":55.5,"branch":"right","side":"left"},
+    {"id":"emergency-right","room":"Emergency exit","steps":58.5,"branch":"right","side":"left"},
+    {"id":"405-2","room":"405","entry":"2","steps":60,"branch":"right","side":"right"}
+  ]
+}
