@@ -4,6 +4,7 @@
   "measurementBasis": "hallway centerline; final door approach is additional",
   "origin": "Hallway junction near room 418 (not a surveyed door position)",
   "geometry": {"junctionNear": 7.09, "junctionFar": 8.75, "leftEnd": -28.5, "rightEnd": 30.75},
+  "elevator": {"u": 5.0, "v": 0, "note": "Main-hallway centerline in front of the elevator by the blue recycling bin; robots arrive here facing the junction"},
   "robot": {"length": 0.62, "width": 0.46, "speed": 0.8, "turnSpeed": 1.4},
   "doors": [
     {"id":"bathroom-male","room":"Male bathroom","steps":6.5,"branch":null,"side":null,"note":"Branch and wall side need confirmation"},

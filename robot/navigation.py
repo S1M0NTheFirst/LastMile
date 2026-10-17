@@ -3,6 +3,7 @@
 u points up the main hallway; v points along the right branch. Heading zero
 faces +v. Door sides are relative to walking away from the junction.
 """
+import copy
 import json
 import math
 from pathlib import Path
@@ -11,6 +12,18 @@ FLOOR = json.loads(Path(__file__).with_name("floor4.json").read_text())
 CENTER_U = (FLOOR["geometry"]["junctionNear"] + FLOOR["geometry"]["junctionFar"]) / 2
 DOORS = {d["id"]: d for d in FLOOR["doors"]}
 DOOR_SURFACE_OFFSET = 0.06
+ELEVATOR = FLOOR["elevator"]
+PICKUP_SECONDS = 3.0
+
+
+def in_stem(u):
+    """The main hallway (stem of the T) runs from the elevator up to the junction."""
+    return u < FLOOR["geometry"]["junctionNear"] - 0.05
+
+
+def hallway_point(u, v):
+    """Snap a pose onto the hallway centerline the robot drives along."""
+    return (u, 0.0) if in_stem(u) else (CENTER_U, v)
 
 
 def door_target(door_id):
@@ -55,21 +68,70 @@ class Navigator:
     def _move(self, u, v, phase):
         self.queue.append({"kind": "move", "u": u, "v": v, "phase": phase})
 
-    def start(self, door_id):
-        target = None if door_id == "junction" else door_target(door_id)
+    def place_at_elevator(self):
+        """Put the robot where it arrives on the floor, facing up the hallway."""
         self.queue = []
-        # A robot at a door first backs out along its approach line.
-        self._move(CENTER_U, self.pose["v"], "returning_to_centerline")
-        self._move(CENTER_U, target["v"] if target else 0.0, "travelling")
-        if target:
-            # Keep the stop observable by the dashboard's one-second state poll.
-            self.queue.append({"kind": "pause", "remaining": 1.5, "phase": "stopped_at_door"})
-            self.queue.append({"kind": "turn", "heading": target["heading"], "phase": "turning_to_door"})
-            self._move(target["u"], target["v"], "approaching_door")
-        self.mission = {"door_id": door_id, "phase": self.queue[0]["phase"], "distance_m": 0.0}
-        if target:
+        self.command = (0.0, 0.0)
+        self.pose.update(u=ELEVATOR["u"], v=ELEVATOR["v"], heading=math.pi / 2, space="floor4")
+        self.mission = {"phase": "at_elevator", "door_id": None}
+
+    def _travel(self, at, to):
+        """Queue centerline legs between two hallway points, via the junction when
+        one end is in the main hallway and the other in the cross hallway."""
+        if in_stem(at[0]) and in_stem(to[0]):
+            self._move(to[0], 0.0, "travelling")
+        elif in_stem(at[0]) or in_stem(to[0]):
+            self._move(CENTER_U, 0.0, "travelling")
+            self._move(to[0], to[1], "travelling")
+        else:
+            self._move(CENTER_U, to[1], "travelling")
+        return to
+
+    def start(self, door_id):
+        return self.start_route([{"door_id": door_id}])
+
+    def start_route(self, stops):
+        """Drive through stops in order. A stop is {"door_id": ...} (a door, or
+        "junction") or {"u": ..., "v": ...} (a hallway point, e.g. a pickup)."""
+        if not stops:
+            raise ValueError("A route needs at least one stop")
+        targets = [None if s.get("door_id") in (None, "junction") else door_target(s["door_id"]) for s in stops]
+        self.queue = []
+        at = hallway_point(self.pose["u"], self.pose["v"])
+        if not in_stem(self.pose["u"]):
+            # A robot at a door first backs out along its approach line.
+            self._move(CENTER_U, self.pose["v"], "returning_to_centerline")
+        for stop, target in zip(stops, targets):
+            if target:
+                at = self._travel(at, (CENTER_U, target["v"]))
+                # Keep the stop observable by the dashboard's one-second state poll.
+                self.queue.append({"kind": "pause", "remaining": 1.5, "phase": "stopped_at_door"})
+                self.queue.append({"kind": "turn", "heading": target["heading"], "phase": "turning_to_door"})
+                self._move(target["u"], target["v"], "approaching_door")
+                if stop is not stops[-1]:
+                    self._move(CENTER_U, target["v"], "returning_to_centerline")
+            elif stop.get("door_id") == "junction":
+                at = self._travel(at, (CENTER_U, 0.0))
+            else:
+                at = self._travel(at, hallway_point(float(stop["u"]), float(stop["v"])))
+                self.queue.append({"kind": "pause", "remaining": float(stop.get("pause", PICKUP_SECONDS)),
+                                   "phase": stop.get("phase", "picking_up")})
+        last = stops[-1]
+        door_id = last.get("door_id")
+        self.mission = {"door_id": door_id, "phase": self.queue[0]["phase"] if self.queue else "idle", "distance_m": 0.0}
+        if targets[-1]:
             self.mission["centerline_distance_m"] = DOORS[door_id]["steps"] * FLOOR["stepMeters"]
         return self.mission
+
+    def route_seconds(self, stops, dt=0.1):
+        """How long the route would take from the current pose, by simulating it."""
+        trial = copy.deepcopy(self)
+        trial.start_route(stops)
+        seconds = 0.0
+        while trial.queue and seconds < 3600:
+            trial.tick(dt)
+            seconds += dt
+        return seconds
 
     def cancel(self):
         self.queue = []
@@ -118,4 +180,5 @@ class Navigator:
             self.queue.pop(0)
             if not self.queue:
                 self.command = (0.0, 0.0)
-                self.mission["phase"] = "at_junction" if self.mission["door_id"] == "junction" else "door_touched"
+                door_id = self.mission["door_id"]
+                self.mission["phase"] = "at_junction" if door_id == "junction" else "door_touched" if door_id else "arrived"
