@@ -31,7 +31,7 @@ function robotHex(r) {
 // the origin; +x east, +z south (so north is -z).
 // ---------------------------------------------------------------------------
 
-const WORLD_RADIUS = 100;
+const WORLD_RADIUS = 200;
 
 const PALETTE = {
   ground: 0x1a2a37,
