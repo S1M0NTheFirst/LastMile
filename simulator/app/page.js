@@ -1427,8 +1427,11 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     }
 
     function syncMeshes() {
-      const robots = robotsRef.current;
       const want = uiRef.current.robotSpace === "hallway" && floor.group ? "hallway" : "campus";
+      // Robots still out on campus are not drawn inside the 4th-floor hallways.
+      const robots = want === "hallway"
+        ? robotsRef.current.filter((r) => r.state?.pose?.space !== "campus")
+        : robotsRef.current;
       if (want !== robotSpace) setRobotSpace(want);
       const names = new Set(robots.map((r) => r.name));
       for (const [name, m] of meshes) {
@@ -2078,7 +2081,19 @@ export default function Page() {
     const id = setInterval(async () => {
       try {
         const res = await fetch(`/api/orchestrator/tasks/${task.task_id}`, { cache: "no-store" });
-        if (res.ok) setTask(await res.json());
+        if (!res.ok) return;
+        const data = await res.json();
+        // Follow a handoff: the replacement task carries the package from here on.
+        if (data.status === "reassigned" && data.replacement_task_id) {
+          const next = await fetch(`/api/orchestrator/tasks/${data.replacement_task_id}`, { cache: "no-store" });
+          if (next.ok) {
+            const replacement = await next.json();
+            log(replacement.handoff_note || `Task handed to ${replacement.robot_id}`);
+            setTask(replacement);
+            return;
+          }
+        }
+        setTask(data);
       } catch {
         // The task stays visible while the orchestrator is temporarily unavailable.
       }
@@ -2233,7 +2248,7 @@ export default function Page() {
             onChange={(e) => setGoal(e.target.value)}
             placeholder="Deliver package P123 to the north entrance"
           />
-          <div className="sub" style={{ marginBottom: 6 }}>north/east/west/south entrance · warehouse · main door · try: robot3 forward 1 m, turn left · robot3 drive until you see a door</div>
+          <div className="sub" style={{ marginBottom: 6 }}>north/east/west/south entrance · warehouse · main door · building a · ECS rooms (407) · try: deliver P1 from building a to 407 · robot3 forward 1 m, turn left · robot3 drive until you see a door</div>
           <button className="btn" disabled={submitting || !goal.trim()}>{submitting ? "THINKING…" : "SEND TASK"}</button>
           {missionTask && !FINAL.includes(missionTask.status) && (
             <button type="button" className="btn danger" style={{ marginLeft: 6 }} onClick={() => cancelTask(missionTask.task_id)}>
@@ -2242,6 +2257,10 @@ export default function Page() {
           )}
         </form>
         {taskMessage && <div className="msg muted">{taskMessage}</div>}
+        {task?.handoff_note && <div className="msg orange">{task.handoff_note}</div>}
+        {task?.type === "deliver_package" && task.status === "completed" && (
+          <div className="msg green">{task.robot_id} delivered package {task.payload?.package_id} to {task.destination?.name || task.payload?.destination?.name}</div>
+        )}
         {task?.replacement_task_id && (
           <div className="msg orange">reassigned to {task.replacement_robot_id} · {task.replacement_task_id}</div>
         )}

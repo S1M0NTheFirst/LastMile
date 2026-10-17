@@ -100,6 +100,32 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(nav.mission["phase"], "door_touched")
         self.assertEqual(nav.command, (0.0, 0.0))
 
+    def test_elevator_route_drives_forward_up_hallway_then_to_door(self):
+        nav = Navigator(power=0.3)
+        nav.place_at_elevator()
+        nav.start("407-1")
+        nav.tick(0.05)
+        self.assertEqual(nav.mission["phase"], "travelling")
+        self.assertGreater(nav.command[0], 0)  # leaves the elevator forward, not in reverse
+        phases = self.complete(nav)
+        self.assertIn("turning_to_hallway", phases)
+        self.assertNotIn("returning_to_centerline", phases)
+        target = door_target("407-1")
+        self.assertAlmostEqual(nav.pose["u"], target["u"])
+        self.assertAlmostEqual(nav.pose["v"], target["v"])
+
+    def test_handoff_route_stops_at_pickup_point_before_door(self):
+        nav = Navigator()
+        nav.place_at_elevator()
+        nav.start_route([{"u": 7.5, "v": 3.1}, {"door_id": "407-1"}])
+        while nav.mission["phase"] != "picking_up":
+            nav.tick(0.05)
+        self.assertAlmostEqual(nav.pose["u"], CENTER_U)  # snapped onto the centerline
+        self.assertAlmostEqual(nav.pose["v"], 3.1)
+        self.complete(nav)
+        self.assertEqual(nav.mission["phase"], "door_touched")
+        self.assertGreater(nav.route_seconds([{"door_id": "junction"}]), 0)
+
     def test_reversing_out_of_door_uses_negative_throttle(self):
         nav = Navigator(power=0.3)
         nav.start("408")

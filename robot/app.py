@@ -7,6 +7,7 @@ every other robot is reachable, so any robot can message any other.
 """
 import os
 import asyncio
+import copy
 import math
 import random
 import time
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Response
 from pydantic import BaseModel
-from navigation import Navigator, FLOOR
+from navigation import DOORS, FLOOR, Navigator
 
 import motors
 
@@ -42,6 +43,13 @@ MAX_MOTOR_POWER = float(os.getenv("MAX_MOTOR_POWER", "1.0"))
 MAX_DRIVE_METERS = float(os.getenv("MAX_DRIVE_METERS", "inf"))
 DRIVE_LIMITS = {"forward": MAX_DRIVE_METERS, "backward": MAX_DRIVE_METERS, "left": 360.0, "right": 360.0}
 METERS_PER_UNIT = 2.0  # the dashboard's 0-100 grid spans 200 m
+# Where the measured 4th floor's building (ECS) sits on the 0-100 campus grid;
+# the dashboard centers the campus map on it.
+FLOOR4_BUILDING = {"x": 50.0, "y": 50.0}
+# Simulated robots start outside on the campus; a real car starts on the 4th
+# floor at the elevator, since that is the only map it can drive.
+START_SPACE = os.getenv("START_SPACE", "campus" if motors.DRIVER == "sim" else "floor4")
+CAMPUS_LEG_SECONDS = float(os.getenv("CAMPUS_LEG_SECONDS", "4"))  # visual-only campus travel
 
 app = FastAPI(title="Robot")
 
@@ -78,6 +86,7 @@ state = {
                  "y": round(random.uniform(0, 100), 1)},
     "heading": 90.0,        # degrees, counter-clockwise from east; 90 = facing north (+y)
     "inbox": [],            # messages received from peers
+    "space": START_SPACE,   # campus (0-100 grid, visual only) | floor4 (measured meters)
     "pose": None,           # authoritative floor-local meters and heading
     "navigation": None,
     "floor_version": "measured-v1",
@@ -251,11 +260,8 @@ async def navigation_loop():
         if navigating:
             state["mode"] = navigator.mission["phase"]
             state["accepting_tasks"] = False
-            g = FLOOR["geometry"]
-            state["position"] = {
-                "x": (navigator.pose["v"] - g["leftEnd"]) / (g["rightEnd"] - g["leftEnd"]) * 100,
-                "y": (navigator.pose["u"] + 1) / (g["junctionFar"] + 1) * 100,
-            }
+            # On the campus map a robot inside the building sits at the building.
+            state["position"] = dict(FLOOR4_BUILDING)
         elif was_navigating and responsive() and not low_battery_notified:
             state["mode"] = "available"
             state["accepting_tasks"] = True
@@ -443,8 +449,99 @@ def step_rate(step: dict) -> float:
 
 
 navigator = make_navigator()
+if START_SPACE == "floor4":
+    navigator.place_at_elevator()
+    state["position"] = dict(FLOOR4_BUILDING)
+else:
+    navigator.pose["space"] = "campus"
 state["pose"] = navigator.pose
 state["navigation"] = navigator.mission
+
+
+def enter_floor4():
+    """Arrive on the 4th floor by the elevator (the campus leg ends at the building)."""
+    navigator.place_at_elevator()
+    state["space"] = "floor4"
+    state["position"] = dict(FLOOR4_BUILDING)
+    state["navigation"] = navigator.mission
+
+
+def delivery_stops(payload: dict) -> list[dict]:
+    """Floor-4 stops for a delivery: an optional handoff pickup, then the door."""
+    stops = []
+    pickup = payload.get("pickup") or {}
+    if pickup.get("space") == "floor4":
+        stops.append({"u": pickup["u"], "v": pickup["v"], "phase": "picking_up"})
+    stops.append({"door_id": payload["destination"]["door_id"]})
+    return stops
+
+
+def delivery_seconds(payload: dict) -> float:
+    """Rough duration so the orchestrator's timeout fits the whole delivery."""
+    seconds = 0.0
+    pickup = payload.get("pickup") or {}
+    if state["space"] == "campus" and pickup.get("space") == "campus":
+        seconds += 2 * CAMPUS_LEG_SECONDS  # to the pickup, then on to the destination
+    elif state["space"] == "campus":
+        seconds += CAMPUS_LEG_SECONDS
+    if payload["destination"].get("door_id"):
+        trial = copy.deepcopy(navigator)
+        if state["space"] == "campus":
+            trial.place_at_elevator()
+        seconds += trial.route_seconds(delivery_stops(payload))
+    return seconds
+
+
+async def slide_to(task: dict, x: float, y: float, seconds: float = CAMPUS_LEG_SECONDS):
+    """Campus travel is visual only: glide across the 0-100 grid."""
+    start = dict(state["position"])
+    steps = max(1, round(seconds / 0.25))
+    for step in range(1, steps + 1):
+        await asyncio.sleep(seconds / steps)
+        if state["status"] != "alive":
+            raise RuntimeError(f"robot became {state['status']} on the way")
+        state["position"] = {
+            "x": round(start["x"] + (x - start["x"]) * step / steps, 1),
+            "y": round(start["y"] + (y - start["y"]) * step / steps, 1),
+        }
+
+
+async def run_delivery(task: dict) -> dict:
+    """Campus legs (visual) to the pickup and the building, then the measured
+    floor-4 route: elevator, optional handoff pickup point, destination door."""
+    payload = task["payload"]
+    destination = payload["destination"]
+    pickup = payload.get("pickup") or {}
+    if state["space"] == "campus" and pickup.get("space") == "campus":
+        task["phase"] = "to_pickup"
+        await slide_to(task, float(pickup["x"]), float(pickup["y"]))
+        task["picked_up_at"] = now()
+    if not destination.get("door_id"):
+        task["phase"] = "to_destination"
+        await slide_to(task, float(destination["x"]), float(destination["y"]))
+        return {"final_position": state["position"]}
+    if state["space"] == "campus":
+        task["phase"] = "to_building"
+        await slide_to(task, FLOOR4_BUILDING["x"], FLOOR4_BUILDING["y"])
+        enter_floor4()
+    if navigator.queue:
+        raise RuntimeError("robot is already on a floor route")
+    navigator.start_route(delivery_stops(payload))
+    task["phase"] = "on_floor4"
+    try:
+        while navigator.queue:
+            await asyncio.sleep(0.1)
+            if state["status"] != "alive":
+                raise RuntimeError(f"robot became {state['status']} on floor 4")
+            if navigator.mission["phase"] == "picking_up" and "picked_up_at" not in task:
+                task["picked_up_at"] = now()
+            task["floor_phase"] = navigator.mission["phase"]
+    finally:
+        if navigator.queue:  # cancelled or failed mid-route
+            navigator.cancel()
+            if motors.DRIVER != "sim":
+                stop_motors()
+    return {"final_pose": dict(navigator.pose), "door_id": destination["door_id"]}
 
 
 def drive_seconds(steps: list[dict]) -> float:
@@ -502,14 +599,13 @@ async def run_task(task_id: str):
     try:
         if task["type"] == "drive":
             task["result"] = await run_drive(task)
-        elif task["type"] in ("move_to", "deliver_package"):
-            if task["type"] == "deliver_package":
-                destination = task["payload"]["destination"]
-                x = float(destination["x"])
-                y = float(destination["y"])
-            else:
-                x = float(task["payload"]["x"])
-                y = float(task["payload"]["y"])
+        elif task["type"] == "deliver_package":
+            task["result"] = await run_delivery(task)
+            task["result"]["delivered"] = True
+            task["result"]["package_id"] = task["payload"]["package_id"]
+        elif task["type"] == "move_to":
+            x = float(task["payload"]["x"])
+            y = float(task["payload"]["y"])
             if not (0 <= x <= 100 and 0 <= y <= 100):
                 raise ValueError("x and y must be between 0 and 100")
 
@@ -526,9 +622,6 @@ async def run_task(task_id: str):
                 task["progress"] = round(step / steps, 2)
 
             task["result"] = {"final_position": state["position"]}
-            if task["type"] == "deliver_package":
-                task["result"]["delivered"] = True
-                task["result"]["package_id"] = task["payload"]["package_id"]
         elif task["type"] == "report_status":
             task["result"] = {"state": dict(state)}
         else:
@@ -581,6 +674,12 @@ async def create_task(
                 status_code=400,
                 detail="deliver_package requires package_id and destination x,y",
             )
+        door_id = destination.get("door_id")
+        if door_id and not (door_id in DOORS and DOORS[door_id]["branch"]):
+            raise HTTPException(status_code=400, detail=f"unknown or unplaced door {door_id}")
+        pickup = req.payload.get("pickup") or {}
+        if pickup and not ({"u", "v"} if pickup.get("space") == "floor4" else {"x", "y"}).issubset(pickup):
+            raise HTTPException(status_code=400, detail="pickup needs u,v on floor4 or x,y on campus")
 
     task = {
         "task_id": req.task_id,
@@ -594,6 +693,8 @@ async def create_task(
     if req.type == "drive":
         # Lets the orchestrator extend its timeout for long drives.
         task["estimated_seconds"] = round(drive_seconds(req.payload["steps"]), 1)
+    if req.type == "deliver_package":
+        task["estimated_seconds"] = round(delivery_seconds(req.payload), 1)
     tasks[req.task_id] = task
     task_workers[req.task_id] = asyncio.create_task(run_task(req.task_id))
     return task
@@ -684,6 +785,8 @@ async def navigate(req: NavigationRequest):
             raise HTTPException(status_code=409, detail="Cancel the current route before choosing another door")
         if not req.door_id:
             raise HTTPException(status_code=400, detail="door_id is required")
+        if state["space"] != "floor4":
+            enter_floor4()  # a campus robot sent to a door takes the elevator up first
         try:
             navigator.start(req.door_id)
         except KeyError:

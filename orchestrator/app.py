@@ -7,12 +7,14 @@ camera, picks one small move, and repeats until the goal is reached. The Gemini
 key never leaves this service.
 """
 import asyncio
+import json
 import os
 import math
 import re
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
@@ -47,7 +49,33 @@ KNOWN_LOCATIONS = {
     "south entrance": {"x": 50.0, "y": 10.0},
     "warehouse": {"x": 20.0, "y": 80.0},
     "main door": {"x": 50.0, "y": 10.0},
+    # Placeholder pickup building for the handoff demo; rename or move freely.
+    "building a": {"x": 20.0, "y": 25.0},
+    # The building with the measured 4th floor; the dashboard centers on it.
+    "ecs": {"x": 50.0, "y": 50.0},
 }
+METERS_PER_UNIT = 2.0  # the dashboard's 0-100 grid spans 200 m
+
+
+def load_floor4():
+    """The measured 4th floor shared with the robots (robot/floor4.json). In
+    Docker, mount it and point FLOOR4_PATH at it."""
+    path = Path(os.getenv("FLOOR4_PATH", Path(__file__).resolve().parent.parent / "robot" / "floor4.json"))
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+FLOOR4 = load_floor4()
+FLOOR4_GEOMETRY = (FLOOR4 or {}).get("geometry", {"junctionNear": 7.09, "junctionFar": 8.75})
+FLOOR4_CENTER_U = (FLOOR4_GEOMETRY["junctionNear"] + FLOOR4_GEOMETRY["junctionFar"]) / 2
+FLOOR4_ELEVATOR = (FLOOR4 or {}).get("elevator", {"u": 5.0, "v": 0})
+# Room number -> the door a delivery uses (the first placed entry, e.g. 407 -> 407-1).
+ROOM_DOORS = {}
+for door in (FLOOR4 or {}).get("doors", []):
+    if door.get("branch") and door.get("side"):
+        ROOM_DOORS.setdefault(door["room"].lower(), door["id"])
 LOCATION_ALIASES = {
     "north gate": "north entrance",
     "east gate": "east entrance",
@@ -56,6 +84,8 @@ LOCATION_ALIASES = {
     "front door": "main door",
 }
 tasks: dict[str, dict] = {}
+# Robot name -> its last /state that answered, so a killed robot's spot is known.
+last_seen: dict[str, dict] = {}
 autopilots: dict[str, dict] = {}  # robot_id -> latest mission
 autopilot_workers: dict[str, asyncio.Task] = {}
 
@@ -107,9 +137,11 @@ async def fleet_snapshot():
                     headers=robot_headers(),
                 )
                 robot_state = state_response.json()
+                last_seen[robot["name"]] = {"state": robot_state, "at": now()}
                 result.append({**robot, "state": robot_state, "reachable": True})
             except (httpx.HTTPError, ValueError):
-                result.append({**robot, "state": None, "reachable": False})
+                result.append({**robot, "state": None, "reachable": False,
+                               "last_seen": last_seen.get(robot["name"])})
         return result
 
 
@@ -118,13 +150,70 @@ def resolve_destination(destination: str):
     normalized = LOCATION_ALIASES.get(normalized, normalized)
     if normalized in KNOWN_LOCATIONS:
         return {"name": normalized, **KNOWN_LOCATIONS[normalized]}
+    # 4th-floor rooms: "407", "room 407", "ECS 407", "ECS-407", or a door id like "407-2".
+    room = re.fullmatch(r"(?:ecs[\s-]*)?(?:room\s*)?([\w-]+)", normalized)
+    if room:
+        key = room.group(1)
+        door_id = ROOM_DOORS.get(key) or next(
+            (d["id"] for d in (FLOOR4 or {}).get("doors", []) if d["id"].lower() == key and d.get("branch")),
+            None,
+        )
+        if door_id:
+            return {"name": f"room {door_id.split('-')[0]}", **KNOWN_LOCATIONS["ecs"],
+                    "space": "floor4", "door_id": door_id}
     coordinates = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", normalized)
     if coordinates:
         return {"name": destination, "x": float(coordinates.group(1)), "y": float(coordinates.group(2))}
     raise HTTPException(
         status_code=400,
-        detail=f"unknown destination '{destination}'; known locations: {', '.join(KNOWN_LOCATIONS)}",
+        detail=(
+            f"unknown destination '{destination}'; known locations: {', '.join(KNOWN_LOCATIONS)}"
+            + (f", or a 4th-floor room in ECS ({', '.join(sorted(ROOM_DOORS))})" if ROOM_DOORS else "")
+        ),
     )
+
+
+def floor4_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Meters along the T-shaped hallway between two (u, v) points: the main
+    hallway runs up to the junction, the cross hallway runs along v."""
+    def snap(u, v):
+        return ("stem", u, 0.0) if u < FLOOR4_GEOMETRY["junctionNear"] - 0.05 else ("branch", FLOOR4_CENTER_U, v)
+    (sa, ua, va), (sb, ub, vb) = snap(*a), snap(*b)
+    if sa == sb == "stem":
+        return abs(ua - ub)
+    if sa == sb == "branch":
+        return abs(va - vb)
+    return abs(ua - ub) + abs(va - vb)
+
+
+def travel_distance(robot_state: dict, target: dict) -> float:
+    """Approximate meters for a robot to reach a target on the campus grid or
+    on the 4th floor (reached through the ECS elevator)."""
+    position = robot_state.get("position") or {"x": 0, "y": 0}
+    pose = robot_state.get("pose") or {}
+    elevator = (FLOOR4_ELEVATOR["u"], FLOOR4_ELEVATOR["v"])
+    on_floor = robot_state.get("space") == "floor4" and "u" in pose
+    here = (pose.get("u"), pose.get("v")) if on_floor else None
+    building = KNOWN_LOCATIONS["ecs"]
+
+    def campus(a, b):
+        return math.hypot(float(a["x"]) - float(b["x"]), float(a["y"]) - float(b["y"])) * METERS_PER_UNIT
+
+    if target.get("space") == "floor4":
+        spot = (float(target["u"]), float(target["v"]))
+        if on_floor:
+            return floor4_distance(here, spot)
+        return campus(position, building) + floor4_distance(elevator, spot)
+    if on_floor:
+        return floor4_distance(here, elevator) + campus(building, target)
+    return campus(position, target)
+
+
+def describe_floor4_spot(u: float, v: float) -> str:
+    if u < FLOOR4_GEOMETRY["junctionNear"] - 0.05:
+        return f"{abs(u - FLOOR4_ELEVATOR['u']):.1f} m from the elevator in the main hallway"
+    side = "right" if v >= 0 else "left"
+    return f"{abs(v):.1f} m down the {side} hallway"
 
 
 async def assign_task(
@@ -137,7 +226,10 @@ async def assign_task(
     excluded_robot_ids: set[str] | None = None,
     retry_count: int = 0,
     allow_handoff: bool = True,
+    target: dict | None = None,
 ):
+    # The nearest robot is chosen by travel_distance to target (defaults to the x,y point).
+    target = target or {"x": target_x, "y": target_y}
     if not (0 <= target_x <= 100 and 0 <= target_y <= 100):
         raise HTTPException(status_code=400, detail="x and y must be between 0 and 100")
 
@@ -194,11 +286,7 @@ async def assign_task(
         raise HTTPException(status_code=409, detail="no suitable robot is available")
 
     def selection_key(item):
-        position = item["state"].get("position") or {"x": 0, "y": 0}
-        distance = math.hypot(
-            float(position.get("x", 0)) - target_x,
-            float(position.get("y", 0)) - target_y,
-        )
+        distance = travel_distance(item["state"], target)
         # Nearest robot wins; battery breaks ties in favor of the healthier one.
         return distance, -float(item["state"].get("battery", 0))
 
@@ -271,7 +359,10 @@ async def assign_delivery_task(
     robot_id: str | None = None,
     excluded_robot_ids: set[str] | None = None,
     retry_count: int = 0,
+    pickup: str | dict | None = None,
 ):
+    """pickup is a location name (where the package waits), or a resolved spot
+    such as {"space": "floor4", "u": ..., "v": ...} where a robot died with it."""
     if not package_id.strip():
         raise HTTPException(status_code=400, detail="package_id is required")
     location = resolve_destination(destination)
@@ -279,6 +370,13 @@ async def assign_delivery_task(
         "package_id": package_id,
         "destination": location,
     }
+    if isinstance(pickup, str) and pickup.strip():
+        pickup = {**resolve_destination(pickup), "space": "campus"}
+        if pickup.get("door_id"):
+            raise HTTPException(status_code=400, detail="pickup must be a campus location such as building a")
+    if pickup:
+        payload["pickup"] = pickup
+    # The robot nearest the package (pickup spot, else the destination) takes it.
     task = await assign_task(
         "deliver_package",
         payload,
@@ -288,6 +386,7 @@ async def assign_delivery_task(
         robot_id,
         excluded_robot_ids,
         retry_count,
+        target=pickup or location,
     )
     task["destination"] = location
     return task
@@ -356,7 +455,14 @@ def gemini_tools():
             "type": "object",
             "properties": {
                 "package_id": {"type": "string", "description": "Package identifier."},
-                "destination": {"type": "string", "description": "Known location name or x,y coordinates."},
+                "destination": {
+                    "type": "string",
+                    "description": "Known location name, a 4th-floor ECS room such as 407, or x,y coordinates.",
+                },
+                "pickup": {
+                    "type": "string",
+                    "description": "Optional known location where the package is picked up first, such as building a.",
+                },
                 "minimum_battery": {"type": "number", "description": "Minimum battery percentage."},
                 "robot_id": {"type": "string", "description": "Optional preferred robot ID."},
             },
@@ -413,6 +519,27 @@ def gemini_tools():
     return [types.Tool(function_declarations=[move_tool, delivery_tool, drive_tool, autopilot_tool])]
 
 
+TASK_WATCH_SECONDS = float(os.getenv("TASK_WATCH_SECONDS", "1"))
+
+
+async def watch_tasks():
+    """Refresh active tasks so a dead robot's task is handed off even when no
+    dashboard is polling."""
+    while True:
+        await asyncio.sleep(TASK_WATCH_SECONDS)
+        for task_id, task in list(tasks.items()):
+            if task.get("status") in ("acknowledged", "running"):
+                try:
+                    await get_task(task_id)
+                except Exception as exc:  # keep watching the other tasks
+                    print(f"task watch failed for {task_id}: {exc!r}", flush=True)
+
+
+@app.on_event("startup")
+async def start_task_watch():
+    asyncio.create_task(watch_tasks())
+
+
 @app.get("/health")
 def health():
     return {
@@ -448,6 +575,7 @@ async def direct_task(req: DirectTaskRequest):
             destination or "",
             req.minimum_battery,
             req.robot_id,
+            pickup=req.payload.get("pickup"),
         )
     if req.type == "drive":
         return await assign_drive_task(req.robot_id, req.payload.get("steps"), req.minimum_battery)
@@ -472,7 +600,9 @@ async def get_task(task_id: str):
         unavailable = not robot or not robot["reachable"] or not robot["state"]
         if robot and robot["state"]:
             unavailable = unavailable or robot["state"].get("status") != "alive"
-            unavailable = unavailable or not robot["state"].get("accepting_tasks", False)
+            # A robot clears accepting_tasks while it drives a floor route, so
+            # only a low-battery return counts as giving the task up.
+            unavailable = unavailable or robot["state"].get("mode") == "returning_to_charge"
 
         if expired or unavailable:
             reason = "task timed out" if expired else "assigned robot became unavailable"
@@ -490,6 +620,23 @@ async def get_task(task_id: str):
     return task
 
 
+def handoff_pickup(task: dict, old_robot: str) -> tuple[dict | None, str]:
+    """Where the replacement collects the package: where the old robot was last
+    seen if it had the package, otherwise the original pickup."""
+    original = task["payload"].get("pickup")
+    seen = (last_seen.get(old_robot) or {}).get("state") or {}
+    had_package = not original or original.get("space") == "floor4" or bool(task.get("picked_up_at"))
+    if not had_package or not seen:
+        return original, "before picking the package up" if not had_package else "at an unknown spot"
+    pose = seen.get("pose") or {}
+    if seen.get("space") == "floor4" and "u" in pose:
+        u, v = float(pose["u"]), float(pose["v"])
+        return {"space": "floor4", "u": round(u, 2), "v": round(v, 2)}, f"on the ECS 4th floor, {describe_floor4_spot(u, v)}"
+    position = seen.get("position") or {}
+    return ({"space": "campus", "x": position.get("x"), "y": position.get("y"), "name": f"{old_robot}'s last position"},
+            f"on campus at ({position.get('x')}, {position.get('y')})")
+
+
 async def reassign_or_fail(task: dict, reason: str):
     # A drive is meant for one physical robot, so it is never moved to another.
     if task["type"] == "drive" or task.get("retry_count", 0) >= task.get("max_retries", MAX_TASK_RETRIES):
@@ -504,13 +651,22 @@ async def reassign_or_fail(task: dict, reason: str):
     try:
         if task["type"] == "deliver_package":
             destination = task["payload"]["destination"]
+            pickup, note = handoff_pickup(task, old_robot)
             replacement = await assign_delivery_task(
                 task["payload"]["package_id"],
-                destination.get("name") or f"{destination['x']},{destination['y']}",
+                destination.get("door_id") or destination.get("name") or f"{destination['x']},{destination['y']}",
                 task.get("minimum_battery", 20),
                 excluded_robot_ids={old_robot},
                 retry_count=task.get("retry_count", 0) + 1,
+                pickup=pickup,
             )
+            task["handoff_note"] = (
+                f"{old_robot} stopped ({reason}) {note}; {replacement['robot_id']} is picking up "
+                f"package {task['payload']['package_id']} there and delivering it to {destination.get('name')}."
+            )
+            replacement["handoff_from"] = old_robot
+            replacement["handoff_reason"] = reason
+            replacement["handoff_note"] = task["handoff_note"]
         else:
             replacement = await assign_move_task(
                 task["payload"]["x"],
@@ -598,7 +754,11 @@ async def chat(req: ChatRequest):
         "available robot and explain the handoff. If the request is unrelated, "
         "explain that only move, drive, and package-delivery tasks are currently supported. "
         "Known locations include north entrance, east entrance, west entrance, "
-        "south entrance, warehouse, and main door. The map uses "
+        "south entrance, warehouse, main door, building a, and ecs. Rooms on the ECS "
+        "4th floor (for example 407) are delivery destinations: pass the room number as "
+        "destination, and pass where the package comes from (for example building a) as "
+        "pickup. If a robot dies mid-delivery the system hands the package to the robot "
+        "closest to where it died. The map uses "
         "x and y from 0 to 100; interpret top "
         "right as approximately (90, 90), top left as (10, 90), bottom right "
         "as (90, 10), and bottom left as (10, 10).\n\n"
@@ -643,6 +803,7 @@ async def chat(req: ChatRequest):
                 str(args.get("destination", "")),
                 float(args.get("minimum_battery", 20)),
                 args.get("robot_id"),
+                pickup=args.get("pickup"),
             )
         else:
             result = await assign_move_task(
@@ -664,7 +825,9 @@ async def chat(req: ChatRequest):
             if result.get("handoff_reason")
             else (
                 f"Assigned {result['robot_id']} to deliver package "
-                f"{result['payload']['package_id']} to {result['destination']['name']}."
+                f"{result['payload']['package_id']}"
+                + (f" from {result['payload']['pickup']['name']}" if result["payload"].get("pickup", {}).get("name") else "")
+                + f" to {result['destination']['name']}."
                 if result["type"] == "deliver_package"
                 else f"Driving {result['robot_id']}: {describe_steps(result['payload']['steps'])}."
                 if result["type"] == "drive"
