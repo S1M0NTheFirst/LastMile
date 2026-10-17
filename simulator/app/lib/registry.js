@@ -45,3 +45,8 @@ export function listRobots() {
 export function getRobot(name) {
   return store.robots.get(name) || null;
 }
+
+// Drops a robot whose container was removed, so it stops showing as "off".
+export function forgetRobot(name) {
+  store.robots.delete(name);
+}

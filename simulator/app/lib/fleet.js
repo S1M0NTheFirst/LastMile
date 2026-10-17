@@ -1,8 +1,8 @@
 import Docker from "dockerode";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, networkInterfaces } from "node:os";
 import { join } from "node:path";
-import { getRobot, listRobots } from "./registry";
+import { forgetRobot, getRobot, listRobots } from "./registry";
 
 // Every robot, on any machine, is known through the registry. Robots whose
 // container runs on this machine's Docker can also be powered on/off.
@@ -15,6 +15,12 @@ const ONLINE_MS = 10_000; // no heartbeat for this long => robot is offline
 
 function isFresh(robot) {
   return Date.now() - robot.lastSeen < ONLINE_MS;
+}
+
+// This machine's own addresses: a robot registered from one of them runs in
+// local Docker, so once its container is gone (join.py --stop) it is forgotten.
+function localAddresses() {
+  return new Set(Object.values(networkInterfaces()).flat().map((i) => i?.address).filter(Boolean));
 }
 
 // join.py labels each container with the host:port it registers under.
@@ -52,6 +58,13 @@ function describe(robot, container) {
 
 export async function getFleet() {
   const containers = await localContainers();
+  const local = localAddresses();
+  // Only prune when Docker answered; an unreachable Docker returns no containers.
+  const dockerUp = await docker.ping().then(() => true, () => false);
+  for (const robot of listRobots()) {
+    const removed = dockerUp && local.has(robot.host) && !containers.has(`${robot.host}:${robot.port}`);
+    if (removed && !isFresh(robot)) forgetRobot(robot.name);
+  }
   return Promise.all(
     listRobots().map(async (robot) => {
       const { container, ...entry } = describe(

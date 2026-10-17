@@ -8,6 +8,9 @@ failure state.
 
 See [Simulator.md](Simulator.md) for the full design.
 
+To run everything end to end, including the Gemini orchestrator and the real
+JetRacer car with camera, battery and LLM driving, see [RUNNING.md](RUNNING.md).
+
 ## Requirements
 
 Every machine that runs robots:
