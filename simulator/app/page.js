@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { FLOOR_DATA, CENTER_U, DOORS, doorFeatures } from "./lib/floor4";
 
 const FINAL = ["completed", "failed", "cancelled", "reassigned"];
 const COLORS = { alive: 0x45d5a2, no_response: 0xffc06b, dead: 0xff7684, off: 0x5b636f, busy: 0x6aaaff };
@@ -30,7 +31,7 @@ function robotHex(r) {
 // the origin; +x east, +z south (so north is -z).
 // ---------------------------------------------------------------------------
 
-const WORLD_RADIUS = 100;
+const WORLD_RADIUS = 200;
 
 const PALETTE = {
   ground: 0x1a2a37,
@@ -116,7 +117,7 @@ function label(scene, text, x, y, z, color = "#e9f4ff", scale = 1) {
   ctx.fillText(text, 18, 34);
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
-  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true, fog: false }));
   const h = 3.2 * scale;
   sprite.scale.set((c.width / c.height) * h, h, 1);
   sprite.position.set(x, y, z);
@@ -286,11 +287,9 @@ function disposeScene(scene) {
 // The main hallway runs into a T junction with a cross hallway; Left_Hallway.jpg and
 // Right_Hallway.jpg look down its two branches.
 //
-// How the numbers were derived: the floor uses 9-inch (0.2286 m) tiles, which matched the
-// 8.75 m measurement to within 2%, so tile counts give widths, and perspective on the tile
-// rows gives positions. Measured lengths (8.75 / 27.75 / 29 m) set the overall scale.
-// Positions near the junction are good to roughly ±0.3 m; toward the far ends of the branches
-// expect ±1–2 m. Edit the numbers below to correct anything.
+// Door centers use the measured step counts in robot/floor4.json. Steps are provisionally
+// centerline distances from the junction near 418. Widths still come from the earlier plan.
+// Bathroom locations remain unplaced until their branch and wall side are confirmed.
 // ---------------------------------------------------------------------------
 const FLOOR4 = {
   elevation: 3 * 3.66, // floor 4 = three typical 3.66 m (12 ft) storeys above ground level
@@ -300,14 +299,12 @@ const FLOOR4 = {
   // hallway (as in Hallway.jpg) faces the ECS entrance. Set to 1 to turn the floor 180°.
   halfTurns: 0,
   wallHeight: 2.75,
-  stemHalfWidth: 0.965, // main hallway is 1.93 m wide (8.4 tiles)
+  stemHalfWidth: 0.965, // previous measured width; not rescaled with the corrected tile size
   stemStart: -1.0, // the hallway behind the camera wasn't photographed; assumed to end 1 m back
-  junctionNear: 7.09, // main hallway walls end here (where the cross hallway begins)
-  junctionFar: 8.75, // far wall of the cross hallway (your 8.75 m); cross hallway is 1.66 m deep
-  leftEnd: -27.75, // Left_Hallway.jpg: 27.75 m to the stair exit
-  // Right_Hallway.jpg: 29 m, but that photo was taken ~1.1 m left of the junction center
-  // (the restroom doors visible in both photos only line up that way), so the end is at 27.9.
-  rightEnd: 27.9,
+  junctionNear: FLOOR_DATA.geometry.junctionNear,
+  junctionFar: FLOOR_DATA.geometry.junctionFar,
+  leftEnd: FLOOR_DATA.geometry.leftEnd, // allow clearance beyond the last measured door
+  rightEnd: FLOOR_DATA.geometry.rightEnd,
   alcove: { v0: -3.14, v1: -1.2, depth: 0.33 }, // water-fountain recess in the far wall
   // Wall-mounted features. "wall" names a wall below; a0..a1 is the span along it
   // (u for main-hallway walls, v for cross-hallway walls). "label" is a name for reference
@@ -318,24 +315,10 @@ const FLOOR4 = {
     { wall: "stemLeft", a0: 5.36, a1: 7.0, kind: "case", label: null },
     { wall: "stemRight", a0: 2.65, a1: 3.75, kind: "elevator", label: "Elevator" },
     { wall: "stemRight", a0: 4.55, a1: 5.45, kind: "elevator", label: "Elevator" },
-    { wall: "far", a0: -0.99, a1: -0.29, kind: "door", label: "Women's restroom", sign: "women" },
-    { wall: "far", a0: -0.07, a1: 0.66, kind: "door", label: "Door" },
-    { wall: "far", a0: 0.86, a1: 1.76, kind: "door", label: "Men's restroom", sign: "men" },
-    { wall: "far", a0: 5.5, a1: 6.3, kind: "door", label: "Door" },
-    { wall: "far", a0: 12.6, a1: 13.5, kind: "door", label: "Door" },
-    { wall: "far", a0: -7.9, a1: -7.0, kind: "door", label: "Door" },
-    { wall: "far", a0: -17.5, a1: -16.6, kind: "door", label: "Door" },
-    { wall: "nearRight", a0: 2.3, a1: 3.6, kind: "double", label: "Double doors" },
-    { wall: "nearRight", a0: 8.8, a1: 9.7, kind: "door", label: "Door" },
-    { wall: "nearRight", a0: 25.9, a1: 26.8, kind: "door", label: "Door" },
-    { wall: "nearLeft", a0: -2.32, a1: -1.42, kind: "door", label: "416 · HyFlex Room" },
-    { wall: "nearLeft", a0: -10.0, a1: -9.1, kind: "door", label: "Door" },
-    { wall: "nearLeft", a0: -11.5, a1: -10.6, kind: "door", label: "Door" },
-    { wall: "nearLeft", a0: -19.9, a1: -19.0, kind: "door", label: "Door" },
     { wall: "alcoveBack", a0: -2.55, a1: -1.65, kind: "fountain", label: "Water fountain" },
     { wall: "endLeft", a0: 7.5, a1: 8.35, kind: "door", label: "Stairs (exit)", exit: true },
     { wall: "endRight", a0: 7.25, a1: 8.6, kind: "glass", label: "Exit to outside" },
-  ],
+  ].concat(doorFeatures()),
   // Free-standing objects: plan position and footprint size.
   objects: [
     { u: 6.1, v: 0.7, w: 0.45, d: 0.35, h: 0.85, color: 0x1f4fa8, label: "Recycling" },
@@ -388,9 +371,10 @@ function tileTexture() {
 // Builds the hallway interior in floor-local coordinates.
 function buildFloor4(F = FLOOR4) {
   const group = new THREE.Group();
+  const occluders = [];
   const walls = floor4Walls(F);
   const H = F.wallHeight;
-  const TILE = 0.2286;
+  const TILE = FLOOR_DATA.tileMeters;
 
   const mat = {
     wall: new THREE.MeshStandardMaterial({ color: 0xf1ede4, roughness: 0.85 }),
@@ -405,14 +389,17 @@ function buildFloor4(F = FLOOR4) {
   };
 
   const box = (w, h, d, m, x, y, z, rotY = 0) => {
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m.clone());
+    mesh.userData.originalOpacity = m.opacity;
+    mesh.userData.originalTransparent = m.transparent;
+    occluders.push(mesh);
     mesh.position.set(x, y, z);
     mesh.rotation.y = rotY;
     group.add(mesh);
     return mesh;
   };
 
-  // Floor slabs with real-scale 9" tiles.
+  // Floor slabs with the measured 25 cm tiles.
   const tex = tileTexture();
   const slab = (u0, u1, v0, v1) => {
     const w = v1 - v0, d = u1 - u0;
@@ -498,6 +485,36 @@ function buildFloor4(F = FLOOR4) {
     const [x, z] = planToLocal(o.u, o.v);
     box(o.w, o.h, o.d, new THREE.MeshStandardMaterial({ color: o.color, roughness: 0.6 }), x, o.h / 2, z);
   }
+
+  const roomLabels = [];
+  const doorMarkers = [];
+  for (const door of DOORS.filter((d) => d.placed)) {
+    const inward = door.wall === "far" ? -1 : 1;
+    const [x, z] = planToLocal(door.u + inward * 0.12, door.v);
+    const sprite = label(group, door.title, x, 2.35, z, "#ffffff", 0.45);
+    sprite.userData.aspect = sprite.scale.x / sprite.scale.y;
+    sprite.material.sizeAttenuation = false;
+    roomLabels.push({ sprite, door });
+    const [sx, sz] = planToLocal(CENTER_U, door.v);
+    const points = [new THREE.Vector3(sx, 0.09, sz), new THREE.Vector3(x, 0.09, z)];
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), new THREE.LineBasicMaterial({ color: 0xffc06b, depthTest: false }));
+    const marker = new THREE.Mesh(new THREE.TorusGeometry(0.3, 0.035, 6, 24), new THREE.MeshBasicMaterial({ color: 0xffc06b }));
+    marker.rotation.x = Math.PI / 2;
+    marker.position.set(sx, 0.09, sz);
+    group.add(line, marker);
+    doorMarkers.push({ doorId: door.id, line, marker });
+  }
+  const origin = new THREE.Mesh(new THREE.TorusGeometry(0.45, 0.04, 6, 32), new THREE.MeshBasicMaterial({ color: 0x45d5a2 }));
+  origin.rotation.x = Math.PI / 2;
+  origin.position.set(0, 0.08, -CENTER_U);
+  group.add(origin);
+  const originLabel = label(group, "418 · JUNCTION · 0 m", 0, 3.8, -CENTER_U, "#45d5a2", 0.5);
+  originLabel.userData.aspect = originLabel.scale.x / originLabel.scale.y;
+  originLabel.material.sizeAttenuation = false;
+  roomLabels.push({ sprite: originLabel, door: null });
+  group.userData.roomLabels = roomLabels;
+  group.userData.doorMarkers = doorMarkers;
+  group.userData.occluders = occluders;
 
   return { group };
 }
@@ -1229,7 +1246,7 @@ async function post(url, body) {
   return data;
 }
 
-function buildRobotMesh(scene) {
+function buildRobotMesh(scene, name) {
   const g = new THREE.Group();
   const body = new THREE.Mesh(
     new THREE.BoxGeometry(0.62, 0.3, 0.46),
@@ -1257,7 +1274,10 @@ function buildRobotMesh(scene) {
   ring.position.y = 0.04;
   g.add(ring);
   scene.add(g);
-  return { group: g, body, ring, trail: [], line: null };
+  const nameLabel = label(scene, name, 0, 1.4, 0, "#ffffff", 0.5);
+  nameLabel.userData.aspect = nameLabel.scale.x / nameLabel.scale.y;
+  nameLabel.material.sizeAttenuation = false;
+  return { group: g, body, ring, nameLabel, trail: [], line: null };
 }
 
 function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, onFloor) {
@@ -1266,7 +1286,8 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     let disposed = false;
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x07131f);
-    scene.fog = new THREE.Fog(0x07131f, 220, 420);
+    // Max camera distance is 360 m; keep the full 100 m campus visible from there.
+    scene.fog = new THREE.Fog(0x07131f, 600, 1100);
     const cam = new THREE.PerspectiveCamera(55, 1, 0.1, 2000);
     cam.position.copy(HOME);
     const ren = new THREE.WebGLRenderer({ antialias: true });
@@ -1290,8 +1311,16 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
 
     // ---- ECS 4th floor ----
     const floor = { group: null, slab: null, anchorMeshes: [], fit: null, view: null };
+    let floorOn = false;
     const cutPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), FLOOR4.elevation + 1.5);
     function setupFloor4(info) {
+      if (floor.group) {
+        scene.add(robotLayer); // preserve robots before disposing the provisional floor
+        scene.remove(floor.group);
+        disposeScene(floor.group);
+        if (floor.slab) { scene.remove(floor.slab); disposeScene(floor.slab); floor.slab = null; }
+        robotSpace = null; // reparent robots into the replacement floor on the next frame
+      }
       const ring = info.anchor?.outer ?? null;
       floor.fit = fitFloor4(ring);
       const built = buildFloor4();
@@ -1339,6 +1368,7 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     const placeholder = new THREE.Group();
     buildPlaceholderWorld(placeholder);
     scene.add(placeholder);
+    setupFloor4({ anchor: null, anchorMeshes: [] }); // usable immediately, even without internet
     onWorld.current?.({ state: "loading", message: "Loading CSULB map data around ECS…" });
     fetchCampusLayout((message) => {
       if (!disposed) onWorld.current?.({ state: "loading", message });
@@ -1365,8 +1395,10 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       })
       .catch((e) => {
         if (disposed) return;
+        scene.remove(placeholder);
+        disposeScene(placeholder);
         onWorld.current?.({ state: "error", message: e.message || String(e) });
-        if (!floor.group) setupFloor4({ anchor: null, anchorMeshes: [] }); // still show the floor, at the map center
+        // The measured floor is already available at the map center.
       });
 
     const meshes = new Map(); // robot name -> mesh record
@@ -1379,7 +1411,9 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
 
     function targetFor(r, space) {
       if (space === "hallway") {
-        const [u, v] = robotToHallway(r.state?.position);
+        const [u, v] = r.state?.pose?.space === "floor4"
+          ? [r.state.pose.u, r.state.pose.v]
+          : robotToHallway(r.state?.position);
         const [x, z] = planToLocal(u, v);
         return { x, z, u, v };
       }
@@ -1400,6 +1434,9 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       for (const [name, m] of meshes) {
         if (!names.has(name)) {
           robotLayer.remove(m.group);
+          robotLayer.remove(m.nameLabel);
+          disposeScene(m.group);
+          disposeScene(m.nameLabel);
           if (m.line) robotLayer.remove(m.line);
           meshes.delete(name);
         }
@@ -1408,12 +1445,27 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         let m = meshes.get(r.name);
         const target = targetFor(r, robotSpace);
         if (!m) {
-          m = buildRobotMesh(robotLayer);
+          m = buildRobotMesh(robotLayer, r.name);
           m.group.userData.name = r.name;
           m.reset = true;
           meshes.set(r.name, m);
         }
         m.hex = robotHex(r);
+        m.authoritative = robotSpace === "hallway" && r.state?.pose?.space === "floor4";
+        if (m.authoritative) {
+          m.heading = r.state.pose.heading;
+          m.target = target;
+          m.route = [];
+          if (m.reset) m.group.position.set(target.x, 0, target.z);
+          m.reset = false;
+          const previous = m.trail[m.trail.length - 1];
+          if (!previous || Math.hypot(previous[0] - target.x, previous[1] - target.z) > 0.03) {
+            m.trail.push([target.x, target.z]);
+            if (m.trail.length > TRAIL_MAX) m.trail.shift();
+            m.trailDirty = true;
+          }
+          continue;
+        }
         if (m.reset) {
           m.reset = false;
           m.group.position.set(target.x, 0, target.z);
@@ -1442,6 +1494,12 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
 
     // Moves a robot along its route; faster when far behind, so it keeps up with updates.
     function stepRobot(m, dt) {
+      if (m.authoritative) {
+        const alpha = 1 - Math.exp(-12 * dt);
+        m.group.position.x = THREE.MathUtils.lerp(m.group.position.x, m.target.x, alpha);
+        m.group.position.z = THREE.MathUtils.lerp(m.group.position.z, m.target.z, alpha);
+        return;
+      }
       if (!m.route?.length) return;
       let remaining = 0;
       let px = m.group.position.x, pz = m.group.position.z;
@@ -1474,6 +1532,7 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       const { trails, selected } = uiRef.current;
       if (m.line && (m.trailDirty || m.lineSel !== (selected === name) || !trails)) {
         robotLayer.remove(m.line);
+        disposeScene(m.line);
         m.line = null;
       }
       if (!trails || m.line || m.trail.length < 2) return;
@@ -1500,10 +1559,22 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     const mouse = new THREE.Vector2();
     // Picking happens on release so dragging the camera doesn't open the robot modal.
     let down = null;
+    let followDrag = null;
     function pointerDown(e) {
       down = [e.clientX, e.clientY];
+      if (uiRef.current.view === "follow" && e.button === 0) {
+        followDrag = [e.clientX, e.clientY];
+        view.setPointerCapture(e.pointerId);
+      }
+    }
+    function rotateFollow(e) {
+      if (!followDrag || uiRef.current.view !== "follow") return;
+      followYaw -= (e.clientX - followDrag[0]) * 0.006;
+      followElevation = THREE.MathUtils.clamp(followElevation + (e.clientY - followDrag[1]) * 0.005, 0.12, 1.45);
+      followDrag = [e.clientX, e.clientY];
     }
     function pick(e) {
+      followDrag = null;
       if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 5) return;
       down = null;
       const rect = view.getBoundingClientRect();
@@ -1519,6 +1590,9 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     }
     view.addEventListener("pointerdown", pointerDown);
     view.addEventListener("pointerup", pick);
+    view.addEventListener("pointermove", rotateFollow);
+    const cancelDrag = () => { followDrag = null; down = null; };
+    view.addEventListener("pointercancel", cancelDrag);
 
     // In Follow / POV the orbit controls are off, so the wheel feeds the same zoom
     // queue as the buttons. In the overview, OrbitControls handles the wheel itself.
@@ -1534,17 +1608,22 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     let lastMode = "overview";
     let returning = false; // easing the camera to a preset (HOME or the 4F view)
     let flyTo = { pos: HOME, target: new THREE.Vector3() };
-    let floorOn = false;
     let followMul = 1; // Follow-mode zoom
+    let followYaw = 0;
+    let followElevation = 0.8;
+    let followedRobot = null;
     let povFov = BASE_FOV; // POV-mode zoom
     let lastLevel = null;
-    const clock = new THREE.Clock();
+    let previousFrame = performance.now();
     const pW = new THREE.Vector3();
     const qW = new THREE.Quaternion();
     const fwd = new THREE.Vector3();
     const tmp = new THREE.Vector3();
     const origin = new THREE.Vector3();
     const homeDist = HOME.length();
+    const labelPoint = new THREE.Vector3();
+    const occlusionRay = new THREE.Raycaster();
+    const overlaps = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 
     // Applies a zoom factor (< 1 zooms in) to whichever camera mode is active.
     function applyZoom(f, mode) {
@@ -1569,10 +1648,14 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       raf = requestAnimationFrame(loop);
       syncMeshes();
       const { view: mode, selected } = uiRef.current;
-      const dt = Math.min(clock.getDelta(), 0.1);
+      placeholder.visible = mode === "overview";
+      const now = performance.now();
+      const dt = Math.min((now - previousFrame) / 1000, 0.1);
+      previousFrame = now;
       // Robots are ~0.6 m long; enlarge them in wide views so they read at that scale.
       // In the hallways they stay life-size except in the far-away campus overview.
       const robotScale = robotSpace === "hallway" ? (mode === "overview" ? 2.5 : 1) : mode === "overview" || mode === "floor4" ? 4 : 1;
+      const nameRects = [];
       for (const [name, m] of meshes) {
         stepRobot(m, dt);
         const s = THREE.MathUtils.lerp(m.group.scale.x, robotScale, 0.1);
@@ -1585,12 +1668,57 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         m.body.material.color.setHex(m.hex);
         m.body.material.emissive.setHex(m.hex);
         m.ring.material.color.setHex(m.hex);
+        m.nameLabel.position.copy(m.group.position).y = 1.2 * s;
+        const labelHeight = 2 * Math.tan(THREE.MathUtils.degToRad(cam.fov / 2)) * (selected === name ? 17 : 14) / view.clientHeight;
+        m.nameLabel.scale.set(labelHeight * m.nameLabel.userData.aspect, labelHeight, 1);
+        m.nameLabel.material.color.setHex(selected === name ? 0xffc06b : 0xffffff);
+        m.nameLabel.visible = uiRef.current.robotLabels && !(mode === "pov" && selected === name);
+        if (m.nameLabel.visible) {
+          m.nameLabel.getWorldPosition(labelPoint).project(cam);
+          const rect = { x: (labelPoint.x + 1) * view.clientWidth / 2, y: (1 - labelPoint.y) * view.clientHeight / 2, w: 17 * m.nameLabel.userData.aspect + 4, h: 21 };
+          let shifts = 0;
+          while (nameRects.some((other) => overlaps(rect, other)) && shifts < 6) { rect.y -= 21; shifts++; }
+          m.nameLabel.visible = shifts < 6 && Math.abs(labelPoint.z) <= 1;
+          if (m.nameLabel.visible) {
+            labelPoint.y += shifts * 42 / view.clientHeight;
+            labelPoint.unproject(cam);
+            m.nameLabel.position.copy(robotLayer.worldToLocal(labelPoint));
+            nameRects.push(rect);
+          }
+        }
         drawTrail(name, m);
       }
       const sel = meshes.get(selected);
       // World-space position and facing of the selected robot (its layer may be the floor group).
       const p = sel ? sel.group.getWorldPosition(pW) : origin;
       if (sel) fwd.set(1, 0, 0).applyQuaternion(sel.group.getWorldQuaternion(qW)).setY(0).normalize();
+      if (mode === "follow" && sel && followedRobot !== selected) {
+        followYaw = Math.atan2(-fwd.x, -fwd.z);
+        followElevation = 0.8;
+        followedRobot = selected;
+      } else if (mode !== "follow") followedRobot = null;
+      if (floor.group) {
+        const labelRects = [];
+        const labels = [...floor.group.userData.roomLabels].sort((a, b) =>
+          Number(b.door?.id === uiRef.current.doorId) - Number(a.door?.id === uiRef.current.doorId));
+        for (const { sprite, door } of labels) {
+          if (door) sprite.position.y = mode === "follow" || mode === "pov" ? 1.8 : 2.35;
+          const close = !door || !sel || Math.abs(door.v - sel.group.position.x) < 12 || door.id === uiRef.current.doorId;
+          sprite.visible = uiRef.current.roomLabels && (mode === "floor4" || ((mode === "follow" || mode === "pov") && close));
+          const height = 2 * Math.tan(THREE.MathUtils.degToRad(cam.fov / 2)) * (door?.id === uiRef.current.doorId ? 16 : 13) / view.clientHeight;
+          sprite.scale.set(height * sprite.userData.aspect, height, 1);
+          sprite.material.color.setHex(door?.id === uiRef.current.doorId ? 0xffc06b : 0xffffff);
+          if (sprite.visible) {
+            sprite.getWorldPosition(labelPoint).project(cam);
+            const rect = { x: (labelPoint.x + 1) * view.clientWidth / 2, y: (1 - labelPoint.y) * view.clientHeight / 2, w: 16 * sprite.userData.aspect + 6, h: 20 };
+            sprite.visible = Math.abs(labelPoint.z) <= 1 && !labelRects.some((other) => overlaps(rect, other));
+            if (sprite.visible) labelRects.push(rect);
+          }
+        }
+        for (const mark of floor.group.userData.doorMarkers) {
+          mark.line.visible = mark.marker.visible = mark.doorId === uiRef.current.doorId && mode !== "overview";
+        }
+      }
       const indoors = robotSpace === "hallway";
       tracking = Boolean((mode === "follow" || mode === "pov") && sel);
       const floorView = mode === "floor4" && floor.view;
@@ -1610,7 +1738,11 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       if (z.reset) {
         z.reset = false;
         z.pending = 0;
-        if (camMode === "follow") followMul = 1;
+        if (camMode === "follow") {
+          followMul = 1;
+          followYaw = Math.atan2(-fwd.x, -fwd.z);
+          followElevation = 0.8;
+        }
         else if (camMode === "pov") povFov = BASE_FOV;
         else returning = true;
       }
@@ -1626,13 +1758,12 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       }
 
       controls.enabled = !tracking && !returning;
-      if (mode === "follow" && sel && indoors) {
-        // Behind and above the robot, looking down into the hallway (there's no ceiling).
-        cam.position.lerp(tmp.copy(p).addScaledVector(fwd, -3.2 * followMul).setY(p.y + 4.2 * followMul), 0.1);
-        cam.lookAt(p.x, p.y, p.z);
-      } else if (mode === "follow" && sel) {
-        cam.position.lerp(tmp.set(p.x + 5 * followMul, p.y + 5.2 * followMul, p.z + 6 * followMul), 0.1);
-        cam.lookAt(p.x, p.y, p.z);
+      if (mode === "follow" && sel) {
+        const radius = (indoors ? 5.3 : 9) * followMul;
+        const horizontal = Math.cos(followElevation) * radius;
+        tmp.set(p.x + Math.sin(followYaw) * horizontal, p.y + Math.sin(followElevation) * radius + 0.4, p.z + Math.cos(followYaw) * horizontal);
+        cam.position.lerp(tmp, 1 - Math.exp(-12 * dt));
+        cam.lookAt(p.x, p.y + 0.4, p.z);
       } else if (mode === "pov" && sel) {
         // Just behind the robot at its own eye height, looking the way it faces.
         const back = indoors ? 0.6 : 1.3, eye = indoors ? 0.95 : 2.1;
@@ -1646,6 +1777,29 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         if (cam.position.distanceTo(flyTo.pos) < 0.5) returning = false;
       } else {
         controls.update();
+      }
+      // A full follow orbit can look across a hallway wall. Fade only the surfaces
+      // between camera and robot so the target remains visible from every azimuth.
+      if (floor.group) {
+        const blocked = new Set();
+        if (tracking && indoors && sel) {
+          scene.updateMatrixWorld(true);
+          cam.updateMatrixWorld();
+          tmp.copy(p).y += 0.35;
+          const distance = tmp.distanceTo(cam.position);
+          occlusionRay.set(cam.position, tmp.sub(cam.position).normalize());
+          occlusionRay.far = Math.max(0, distance - 0.2);
+          for (const hit of occlusionRay.intersectObjects(floor.group.userData.occluders, false)) blocked.add(hit.object);
+        }
+        for (const mesh of floor.group.userData.occluders) {
+          const fade = blocked.has(mesh);
+          if (mesh.userData.faded === fade) continue;
+          mesh.userData.faded = fade;
+          mesh.material.opacity = fade ? 0.12 : mesh.userData.originalOpacity;
+          mesh.material.transparent = fade || mesh.userData.originalTransparent;
+          mesh.material.depthWrite = !fade;
+          mesh.material.needsUpdate = true;
+        }
       }
       const level = Math.round(zoomLevel(camMode) * 10) / 10;
       if (level !== lastLevel) {
@@ -1662,6 +1816,8 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       window.removeEventListener("resize", size);
       view.removeEventListener("pointerdown", pointerDown);
       view.removeEventListener("pointerup", pick);
+      view.removeEventListener("pointermove", rotateFollow);
+      view.removeEventListener("pointercancel", cancelDrag);
       view.removeEventListener("wheel", wheel);
       controls.dispose();
       disposeScene(scene);
@@ -1772,6 +1928,10 @@ export default function Page() {
   // Where robots are drawn: inside the ECS 4th-floor hallways (default) or on the campus map.
   const [robotSpace, setRobotSpaceState] = useState("hallway");
   const [trails, setTrails] = useState(true);
+  const [robotLabels, setRobotLabels] = useState(true);
+  const [roomLabels, setRoomLabels] = useState(true);
+  const [doorId, setDoorId] = useState("416-a");
+  const [navigationPending, setNavigationPending] = useState(false);
   const [dash, setDash] = useState(true);
   const [events, setEvents] = useState(["Dashboard connected to fleet registry"]);
   const [toastText, setToastText] = useState("");
@@ -1795,7 +1955,7 @@ export default function Page() {
   const toastTimer = useRef(null);
 
   robotsRef.current = robots;
-  uiRef.current = { view, trails, selected, robotSpace };
+  uiRef.current = { view, trails, selected, robotSpace, robotLabels, roomLabels, doorId };
   onPick.current = (name) => {
     setSelected(name);
     setModalOpen(true);
@@ -1905,7 +2065,7 @@ export default function Page() {
 
   useEffect(() => {
     refresh();
-    const id = setInterval(refresh, 2000);
+    const id = setInterval(refresh, 1000);
     return () => clearInterval(id);
   }, []);
 
@@ -1936,6 +2096,25 @@ export default function Page() {
       toast(`Failed: ${e.message}`);
     }
     refresh();
+  }
+
+  async function navigateDoor(target, cancel = false) {
+    if (!selected || navigationPending) return;
+    setNavigationPending(true);
+    try {
+      await post(`/api/robots/${selected}/navigate`, cancel ? { cancel: true } : { door_id: target });
+      log(`${selected}: ${cancel ? "route cancelled" : target === "junction" ? "returning to junction" : `navigating to ${target}`}`);
+      if (!cancel) {
+        setRobotSpace("hallway");
+        setView("follow");
+      }
+      await refresh();
+    } catch (error) {
+      toast(error.message);
+      log(`Navigation failed: ${error.message}`);
+    } finally {
+      setNavigationPending(false);
+    }
   }
 
   async function submitGoal(e) {
@@ -1987,6 +2166,10 @@ export default function Page() {
   }
 
   const sel = robots.find((r) => r.name === selected);
+  const door = DOORS.find((d) => d.id === doorId);
+  const phase = sel?.state?.navigation?.phase || "idle";
+  const routeActive = !["idle", "at_junction", "door_touched", "cancelled"].includes(phase);
+  const canNavigate = sel && robotStatus(sel) === "alive" && sel.state?.floor_version === "measured-v1" && !routeActive && !navigationPending;
   const online = robots.filter((r) => robotStatus(r) === "alive").length;
   const activeTasks = tasks.filter((t) => !FINAL.includes(t.status));
   const doneTasks = tasks.filter((t) => t.status === "completed").length;
@@ -2023,6 +2206,9 @@ export default function Page() {
             </button>
           ))}
           <button className="btn" onClick={() => setTrails(!trails)}>PATH TRAILS: {trails ? "ON" : "OFF"}</button>
+          <button className="btn" onClick={() => setRobotLabels(!robotLabels)}>ROBOT LABELS: {robotLabels ? "ON" : "OFF"}</button>
+          <button className="btn" onClick={() => setRoomLabels(!roomLabels)}>ROOM LABELS: {roomLabels ? "ON" : "OFF"}</button>
+          {view === "follow" && <button className="btn" onClick={zoomReset}>RESET BEHIND ROBOT</button>}
           <button className="btn" onClick={() => setDash(!dash)}>DASHBOARD: {dash ? "ON" : "OFF"}</button>
           <div className="zoom" role="group" aria-label="Camera zoom">
             <button className="btn" onClick={zoomOut} title="Zoom out (−)" aria-label="Zoom out">−</button>
@@ -2102,7 +2288,7 @@ export default function Page() {
               </span>
             </div>
             <div className="msg muted">
-              Hallways rebuilt from your photos and measurements, centered in the main block of the ECS building.
+              Origin: junction near 418. 1 step = 0.5 m · 1 tile = 0.25 m. Door distances are provisionally measured along the hallway centerline; the final approach is additional.
             </div>
             {floorInfo && (
               <>
@@ -2113,6 +2299,40 @@ export default function Page() {
                 )}
               </>
             )}
+          </div>
+
+          <div className="card navigation-card">
+            <div className="card-title"><span>Measured room navigation</span><span className="green">{sel?.name || "SELECT ROBOT"}</span></div>
+            <label className="label" htmlFor="navigation-robot">ROBOT</label>
+            <select id="navigation-robot" className="select door-select" value={selected || ""} onChange={(e) => setSelected(e.target.value)}>
+              {!robots.length && <option value="">Start a robot with join.py</option>}
+              {robots.map((r) => <option key={r.name} value={r.name}>{r.name} · {robotStatus(r)}</option>)}
+            </select>
+            <label className="label" htmlFor="door-target">DESTINATION DOOR</label>
+            <select id="door-target" className="select door-select" value={doorId} onChange={(e) => setDoorId(e.target.value)}>
+              {DOORS.map((d) => <option key={d.id} value={d.id}>{d.title} · {d.distance.toFixed(2)} m{!d.placed ? " · UNPLACED" : ""}</option>)}
+            </select>
+            <div className="row"><span>From junction</span><b>{door.steps} steps · {door.distance.toFixed(2)} m · {door.distance / FLOOR_DATA.tileMeters} tiles</b></div>
+            <div className="row"><span>Branch / wall side</span><b>{door.placed ? `${door.branch} / ${door.side}` : "Needs confirmation"}</b></div>
+            <div className="msg muted">Left/right wall sides are viewed walking away from the junction.</div>
+            {door.note && <div className="msg orange">{door.note}</div>}
+            <div className="navigation-actions">
+              <button className="btn" disabled={!canNavigate || !door.placed} onClick={() => navigateDoor(doorId)}>GO TO DOOR</button>
+              <button className="btn" disabled={!canNavigate} onClick={() => navigateDoor("junction")}>RETURN TO JUNCTION</button>
+              <button className="btn danger" disabled={!sel?.state || !routeActive || navigationPending || sel.power === "off"} onClick={() => navigateDoor(null, true)}>CANCEL ROUTE</button>
+            </div>
+            {sel?.state && !sel.state.floor_version && <div className="msg orange">Rebuild and recreate this robot with join.py to enable measured navigation.</div>}
+            <div className="row"><span>Phase</span><b className={phase === "door_touched" ? "green" : "blue"}>{phase.replaceAll("_", " ")}</b></div>
+            {sel?.state?.navigation?.door_id && <div className="row"><span>Robot destination</span><b>{sel.state.navigation.door_id}</b></div>}
+            {sel?.state?.pose && <div className="row"><span>Floor pose (m)</span><span>u {sel.state.pose.u.toFixed(2)} · v {sel.state.pose.v.toFixed(2)}</span></div>}
+            <div className="msg muted">Travel → stop → turn → slow approach → door touched. This simulates closed-door contact; it does not open doors or enter rooms.</div>
+            {view === "follow" && <div className="msg green">Drag the map to rotate 360° around the robot. Scroll to zoom.</div>}
+            <details className="door-directory">
+              <summary>All measured entrances ({DOORS.length})</summary>
+              {DOORS.map((d) => <button key={d.id} className={`door-entry ${doorId === d.id ? "chosen" : ""}`} onClick={() => { setDoorId(d.id); setView("floor4"); }}>
+                <span>{d.title}{!d.placed ? " · unplaced" : ""}</span><span>{d.distance.toFixed(2)} m</span>
+              </button>)}
+            </details>
           </div>
 
           <div className="card">
@@ -2169,7 +2389,7 @@ export default function Page() {
             <div className="row"><span>Registry</span><b className={error ? "red" : "green"}>{error ? "ERROR" : "ONLINE"}</b></div>
             <div className="row"><span>Local containers</span><b>{robots.filter((r) => !r.remote).length}</b></div>
             <div className="row"><span>Remote robots</span><b>{robots.filter((r) => r.remote).length}</b></div>
-            <div className="row"><span>Refresh</span><b>2 sec</b></div>
+            <div className="row"><span>Refresh</span><b>1 sec</b></div>
           </div>
 
           <div className="card">
@@ -2182,7 +2402,7 @@ export default function Page() {
       {world?.state === "loading" && <div className="world-note info">{world.message}</div>}
       {world?.state === "error" && (
         <div className="world-note">
-          Campus map failed to load: {world.message}. Showing the {WORLD_RADIUS} m perimeter only.
+          Campus map failed to load: {world.message}. The measured floor remains available at the map center.
           <br />
           <button className="btn" style={{ marginTop: 6 }} onClick={reloadMap}>RETRY</button>
         </div>

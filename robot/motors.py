@@ -18,10 +18,6 @@ DRIVER = os.getenv("MOTOR_DRIVER", "sim")
 DRIVERS = ("sim", "jetracer")
 # The container reaches the bridge through the Jetson's LAN address.
 BRIDGE_URL = os.getenv("MOTOR_BRIDGE_URL") or f"http://{os.getenv('HOST_IP', '127.0.0.1')}:8090"
-_client = httpx.Client(
-    limits=httpx.Limits(max_connections=2, max_keepalive_connections=1),
-    timeout=httpx.Timeout(0.5),
-)
 
 
 def check_driver():
@@ -38,10 +34,11 @@ def set_drive(throttle: float, steering: float):
         return
     token = os.getenv("ROBOT_AUTH_TOKEN", "")
     try:
-        response = _client.post(
+        response = httpx.post(
             f"{BRIDGE_URL}/drive",
             json={"throttle": throttle, "steering": steering},
             headers={"Authorization": f"Bearer {token}"} if token else {},
+            timeout=0.5,
         )
         response.raise_for_status()
     except httpx.HTTPError as exc:

@@ -104,7 +104,6 @@ class Camera:
     def __init__(self):
         self.lock = threading.Lock()
         self.frame = None
-        self.jpeg_frame = None
         self.error = None
         self.started = False
 
@@ -121,14 +120,11 @@ class Camera:
             if error:
                 raise RuntimeError(error)
             if frame is not None:
-                if self.jpeg_frame is not None:
-                    return self.jpeg_frame
                 import cv2
                 ok, data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if not ok:
                     raise RuntimeError("could not encode the camera frame")
-                self.jpeg_frame = data.tobytes()
-                return self.jpeg_frame
+                return data.tobytes()
             time.sleep(0.05)
         raise RuntimeError("camera gave no frame within 5 s")
 
@@ -150,7 +146,6 @@ class Camera:
                     raise RuntimeError("camera stopped delivering frames")
                 with self.lock:
                     self.frame = frame
-                    self.jpeg_frame = None
         except Exception as exc:
             print("camera: {}".format(exc), flush=True)
             with self.lock:

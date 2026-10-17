@@ -16,21 +16,12 @@ export REGISTRY_URL="http://<machine-b-ip>:3000/api/registry"
 export GEMINI_API_KEY="<your-key>"
 export GEMINI_MODEL="gemini-3.8-flash"
 export ROBOT_AUTH_TOKEN="a-shared-local-secret"
-# Optional: how often a closed door is rechecked during autopilot.
-export DOOR_RECHECK_SECONDS="0.5"
 
 orchestrator/.venv/bin/uvicorn orchestrator.app:app --host 0.0.0.0 --port 8001
 ```
 
 The Gemini key remains in the orchestrator process and is never sent to a
 browser or robot.
-
-Autopilot asks Gemini to classify the doorway as `open`, `closed`, or
-`not_visible`. A closed door produces no motor command and is rechecked after
-`DOOR_RECHECK_SECONDS`; when it becomes open, the robot is limited to a short
-forward entry move before requesting another image. Keep moves short near
-obstacles. The orchestrator and motor bridge reuse HTTP connections, which
-avoids reconnecting for every camera/task/motor request.
 
 ## Start robots
 

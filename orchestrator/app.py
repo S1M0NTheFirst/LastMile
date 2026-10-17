@@ -39,7 +39,6 @@ AUTOPILOT_MAX_STEPS = int(os.getenv("AUTOPILOT_MAX_STEPS", "20"))
 # Largest single autopilot move, so the car re-checks the camera often.
 AUTOPILOT_MAX_METERS = float(os.getenv("AUTOPILOT_MAX_METERS", "2.0"))
 AUTOPILOT_MAX_DEGREES = float(os.getenv("AUTOPILOT_MAX_DEGREES", "90"))
-DOOR_RECHECK_SECONDS = float(os.getenv("DOOR_RECHECK_SECONDS", "0.5"))
 FINAL_TASK_STATUSES = ("completed", "failed", "cancelled", "reassigned")
 KNOWN_LOCATIONS = {
     "north entrance": {"x": 90.0, "y": 90.0},
@@ -59,9 +58,6 @@ LOCATION_ALIASES = {
 tasks: dict[str, dict] = {}
 autopilots: dict[str, dict] = {}  # robot_id -> latest mission
 autopilot_workers: dict[str, asyncio.Task] = {}
-http_client = httpx.AsyncClient(
-    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
-)
 
 
 class ChatRequest(BaseModel):
@@ -228,20 +224,20 @@ async def assign_task(
         task["handoff_reason"] = handoff_reason
     tasks[task_id] = task
     try:
-        response = await http_client.post(
-            f"{robot_url(robot)}/tasks",
-            headers={**robot_headers(), "Content-Type": "application/json"},
-            json={"task_id": task_id, "type": task_type, "payload": payload},
-            timeout=5,
-        )
-        if response.status_code >= 400:
-            task["status"] = "failed"
-            task["error"] = response.text
-            raise HTTPException(status_code=502, detail=f"robot rejected task: {response.text}")
-        task.update(response.json())
-        task["status"] = "acknowledged"
-        task["deadline_epoch"] += float(task.get("estimated_seconds", 0))
-        return task
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.post(
+                f"{robot_url(robot)}/tasks",
+                headers={**robot_headers(), "Content-Type": "application/json"},
+                json={"task_id": task_id, "type": task_type, "payload": payload},
+            )
+            if response.status_code >= 400:
+                task["status"] = "failed"
+                task["error"] = response.text
+                raise HTTPException(status_code=502, detail=f"robot rejected task: {response.text}")
+            task.update(response.json())
+            task["status"] = "acknowledged"
+            task["deadline_epoch"] += float(task.get("estimated_seconds", 0))
+            return task
     except httpx.HTTPError as exc:
         task["status"] = "failed"
         task["error"] = str(exc)
@@ -683,8 +679,9 @@ async def chat(req: ChatRequest):
 # ---- camera + autopilot -----------------------------------------------------
 
 async def find_robot(robot_id: str) -> dict:
-    response = await http_client.get(REGISTRY_URL, timeout=3)
-    response.raise_for_status()
+    async with httpx.AsyncClient(timeout=3) as client:
+        response = await client.get(REGISTRY_URL)
+        response.raise_for_status()
     robot = next((r for r in response.json().get("robots", []) if r["name"] == robot_id), None)
     if not robot:
         raise HTTPException(status_code=404, detail=f"{robot_id} is not registered")
@@ -694,11 +691,8 @@ async def find_robot(robot_id: str) -> dict:
 async def camera_frame(robot_id: str) -> bytes:
     try:
         robot = await find_robot(robot_id)
-        response = await http_client.get(
-            f"{robot_url(robot)}/camera",
-            headers=robot_headers(),
-            timeout=8,
-        )
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.get(f"{robot_url(robot)}/camera", headers=robot_headers())
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"{robot_id} camera unreachable: {exc}")
     if response.status_code != 200:
@@ -723,11 +717,6 @@ def autopilot_tools():
             "type": "object",
             "properties": {
                 "observation": {"type": "string", "description": "What the camera shows, in one short sentence."},
-                "door_state": {
-                    "type": "string",
-                    "enum": ["open", "closed", "not_visible"],
-                    "description": "Whether the doorway ahead is open, closed, or not visible.",
-                },
                 "action": {"type": "string", "enum": ["forward", "backward", "left", "right"]},
                 "amount": {
                     "type": "number",
@@ -739,7 +728,7 @@ def autopilot_tools():
                 "speed": SPEED_PARAMETER,
                 "reason": {"type": "string", "description": "Why this move gets closer to the goal."},
             },
-            "required": ["observation", "door_state", "action", "amount", "reason"],
+            "required": ["observation", "action", "amount", "reason"],
         },
     )
     finish_tool = types.FunctionDeclaration(
@@ -749,15 +738,10 @@ def autopilot_tools():
             "type": "object",
             "properties": {
                 "observation": {"type": "string", "description": "What the camera shows, in one short sentence."},
-                "door_state": {
-                    "type": "string",
-                    "enum": ["open", "closed", "not_visible"],
-                    "description": "Whether the doorway ahead is open, closed, or not visible.",
-                },
                 "success": {"type": "boolean", "description": "True if the goal was reached."},
                 "summary": {"type": "string", "description": "One sentence for the user."},
             },
-            "required": ["observation", "door_state", "success", "summary"],
+            "required": ["observation", "success", "summary"],
         },
     )
     return [types.Tool(function_declarations=[move_tool, finish_tool])]
@@ -781,10 +765,7 @@ def autopilot_prompt(mission: dict, step: int) -> str:
         f"moves (up to {AUTOPILOT_MAX_METERS:g} m) when the path ahead is clearly open. "
         "If the goal asks for a speed (full speed, fast, slowly), set speed on every "
         "move to match: 1 is full speed, 0.3 is normal. The image is all you know "
-        "about the world. If a closed door is visible ahead, report door_state=closed "
-        "and do not move; the controller will stop and check again. Only drive "
-        "forward through the doorway after reporting door_state=open. Never finish "
-        "successfully while the door is closed.\n\n"
+        "about the world.\n\n"
         f"This is step {step} of at most {mission['max_steps']}.\n"
         f"Moves so far:\n{history}"
     )
@@ -795,7 +776,7 @@ async def wait_for_drive(task_id: str) -> dict:
         task = await get_task(task_id)
         if task["status"] in FINAL_TASK_STATUSES:
             return task
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.3)
 
 
 async def run_autopilot(mission: dict):
@@ -822,36 +803,18 @@ async def run_autopilot(mission: dict):
             if not calls:
                 raise RuntimeError(f"Gemini did not choose a move: {response.text}")
             args = dict(calls[0].args or {})
-            door_state = str(args.get("door_state", "not_visible")).lower()
-            if door_state not in ("open", "closed", "not_visible"):
-                door_state = "not_visible"
-            entry = {
-                "step": step,
-                "observation": str(args.get("observation", "")),
-                "door_state": door_state,
-                "ts": time.time(),
-            }
+            entry = {"step": step, "observation": str(args.get("observation", "")), "ts": time.time()}
             mission["log"].append(entry)
 
             if calls[0].name == "finish":
-                if door_state == "closed":
-                    mission["phase"] = "waiting_for_door"
-                    await asyncio.sleep(DOOR_RECHECK_SECONDS)
-                    continue
                 entry["summary"] = str(args.get("summary", ""))
                 mission["status"] = "succeeded" if args.get("success") else "gave_up"
                 mission["summary"] = entry["summary"]
                 return
 
-            if door_state == "closed":
-                mission["phase"] = "waiting_for_door"
-                await asyncio.sleep(DOOR_RECHECK_SECONDS)
-                continue
-            action = "forward" if door_state == "open" else str(args.get("action", "")).lower()
+            action = str(args.get("action", "")).lower()
             limit = AUTOPILOT_MAX_METERS if action in ("forward", "backward") else AUTOPILOT_MAX_DEGREES
             amount = round(min(max(float(args.get("amount", 0)), 0.05), limit), 2)
-            if door_state == "open":
-                amount = min(amount, 0.5)
             entry.update(action=action, amount=amount, reason=str(args.get("reason", "")))
             move = {"action": action, "amount": amount}
             if args.get("speed"):

@@ -1,69 +1,223 @@
-# LastMile
+# LastMile — Robot Swarm Simulator
 
-# JetRacer Object Detection with Fixed Movement Scheme
+A local simulation environment for testing multi-robot coordination logic before
+running it on real hardware. Each robot runs as its own Docker container, on
+one machine or spread across many, and a Next.js web app (the orchestrator + UI)
+lets you watch the fleet on a map and control each robot's power, battery, and
+failure state.
 
-Autonomous behavior for the JetRacer AI kit: the car uses onboard object detection to recognize objects in its camera feed and executes a predetermined movement in response. No manual driving required.
+See [Simulator.md](Simulator.md) for the full design.
 
-## Overview
+## Requirements
 
-This project runs entirely on the Jetson Nano's host Python environment (JetRacer's stock Jupyter Lab, port 8888). No Docker container or separate build step required. It uses OpenCV's built-in DNN module with a pretrained SSD-MobileNet-v2 model (trained on COCO, 80 object classes) to detect objects in real time and trigger fixed motor responses.
+Every machine that runs robots:
 
-## How It Works
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (running), or Docker Engine on Linux
+- [Python](https://www.python.org/) 3.8+ (`python3` on macOS/Linux, `python` on Windows)
 
-1. **Camera capture**: frames are grabbed continuously from the CSI camera via `jetcam`.
-2. **Object detection**: each frame (or every Nth frame, for performance) is run through SSD-MobileNet-v2 via `cv2.dnn`, returning the detected object's class and confidence.
-3. **Action mapping**: the highest-confidence detection is looked up in a class-to-action dictionary (e.g. `"stop sign"` maps to stop, `"person"` maps to turn left).
-4. **Movement execution**: the mapped action sets `NvidiaRacecar`'s steering/throttle for a fixed duration, then returns to idle.
-5. **Live preview**: the camera feed, with detection boxes and labels drawn on it, streams to an `ipywidgets` image widget so you can watch what the model sees while it runs.
+The one machine that runs the simulator also needs:
 
-## Hardware
+- [Node.js](https://nodejs.org/) 18+ and npm
 
-- JetRacer AI Kit (Jetson Nano)
-- CSI camera (single camera setup)
+## Clone
 
-## Software Requirements
-
-Everything below runs from the stock JetRacer Jupyter Lab environment. No additional installs needed beyond what ships with the kit:
-
-- `jetcam` (camera access)
-- `jetracer` (motor control via `NvidiaRacecar`)
-- `opencv-python` (`cv2`, including the `dnn` module)
-- `ipywidgets` (live preview)
-- `numpy`
-
-## Setup
-
-1. Open the notebook in your JetRacer Jupyter Lab (port 8888).
-2. Run the model download cell: this pulls SSD-MobileNet-v2's COCO weights (~65MB) and config file. One-time download, safe to re-run.
-3. Run the remaining cells in order: camera init → model load → car init → action mapping → live preview widget → main loop.
-4. Use the Jupyter stop button to interrupt the main loop safely; the car will stop rather than freeze mid-maneuver.
-
-## Configuring Detected Objects and Actions
-
-Edit the `ACTIONS` dictionary to map any of the 80 COCO class names to a movement function:
-
-```python
-ACTIONS = {
-    "stop sign": stop_car,
-    "person": turn_left,
-    "bottle": turn_right,
-}
+```bash
+git clone https://github.com/S1M0NTheFirst/LastMile.git
+cd LastMile
 ```
 
-Movement functions (`stop_car`, `turn_left`, `turn_right`, `drive_forward`) control steering angle, throttle, and duration. Adjust these values to tune each maneuver.
+## How it works
 
-## Known Issues / Notes
+The simulator (Next.js app) is also the fleet's **registry**. Any machine on
+the same network can start any number of robots with `join.py`; each robot
+registers with the simulator, which names it first-come-first-served
+(`robot0`, `robot1`, ...), so names never clash across machines. The simulator
+shows every registered robot, and robots look each other up in the registry,
+so any robot can message any other, on any machine.
 
-- **Throttle direction**: depending on ESC/motor wiring, positive throttle may drive the car backward. Fix by setting `car.throttle_gain = -1.0` once after creating the `NvidiaRacecar` object, rather than negating throttle in every action function.
-- **Detection speed**: object detection runs on CPU (standard OpenCV builds on Jetson typically lack CUDA-enabled `dnn`), so expect roughly 1–4 detections per second rather than real-time. Running detection every Nth frame (rather than every frame) is recommended to keep the live preview responsive.
-- **Cooldown**: a cooldown timer between triggered actions prevents a stationary object from re-triggering its action every single frame.
+Works across macOS, Windows and Linux. Each machine needs Docker and Python 3;
+the machine hosting the simulator also needs Node.js.
 
-## Project Context
+## Run the simulation
 
-Built as part of an autonomous delivery bot project (Jetson Nano + single camera), also serving as the course project for Advanced Artificial Intelligence.
+**1. Start the simulator** on one machine (the "registry machine"):
 
-## Future Improvements
+```bash
+cd simulator
+npm install      # first time only
+npm run dev
+```
 
-- [ ] Explore TensorRT-optimized inference for faster detection (higher setup complexity, but real-time performance)
-- [ ] Train a custom detector for objects specific to the delivery scenario, rather than relying on generic COCO classes
-- [ ] Add distance/size-based logic (e.g. only react once an object's bounding box is large enough to indicate proximity)
+Open http://localhost:3000. Note this machine's LAN IP:
+
+```bash
+ipconfig getifaddr en0    # macOS
+ipconfig                  # Windows (IPv4 Address)
+hostname -I               # Linux
+```
+
+**2. Start robots on any machine**, including the registry machine
+(`<registry-ip>` is the IP from step 1):
+
+```bash
+python3 join.py --registry <registry-ip>:3000 --count 20
+```
+
+Run it again to add more; run it on as many machines as you like. Each run
+builds the `lastmile` image locally (so Apple Silicon and Intel/AMD machines
+both work) and picks free host ports starting at 8000.
+
+In the simulator you can set status/battery for every robot. On/Off works for
+robots on the registry machine; other machines' robots show as `remote` and
+are powered from their own machine (`python3 join.py --stop`).
+
+## Add another machine
+
+Repeat this on every machine you want to add (any OS, any number of machines).
+The simulator must already be running on the registry machine.
+
+**1. Get on the same network** as the registry machine (same Wi-Fi/LAN, or
+both on Tailscale; see Troubleshooting if your Wi-Fi blocks it).
+
+**2. Get the code:**
+
+```bash
+git clone https://github.com/S1M0NTheFirst/LastMile.git
+cd LastMile
+```
+
+(or `git pull` if you already have it)
+
+**3. Start Docker**, then join with as many robots as you want:
+
+```bash
+python3 join.py --registry <registry-ip>:3000 --count 10
+```
+
+`join.py` first checks it can reach the registry and stops with a clear error
+if it can't. The new robots appear in the simulator within a few seconds,
+named after the last existing robot (e.g. `robot20`, `robot21`, ...) and marked
+`remote`.
+
+**4. Add more later** by running `join.py` again on the same machine; it picks
+free ports automatically. Check a robot registered with
+`docker logs lastmile-<port>` (it prints `registered with ... as robotN`).
+
+**5. Leave the fleet:** `python3 join.py --stop` removes this machine's robots.
+They stay listed as offline in the simulator until the simulator restarts.
+
+## Stop
+
+```bash
+python3 join.py --stop       # on each machine: remove its robots
+# Ctrl+C in the simulator terminal to stop the web app
+# (restarting the simulator clears the robot list; names start at robot0 again)
+```
+
+## Poke the robots directly (optional)
+
+Each robot's API is at `<machine-ip>:<port>` (shown in the simulator):
+
+```bash
+curl localhost:8000/state
+
+# have that robot message robot3, wherever robot3 runs
+curl -X POST localhost:8000/send \
+  -H 'Content-Type: application/json' \
+  -d '{"to":"robot3","body":{"msg":"hello"}}'
+
+curl localhost:8000/peers    # every other robot and its address
+```
+
+`delivered:true` means the message reached robot3's inbox. A `503` means the
+target is `dead`/`no_response`; a connection error means it is powered off.
+
+## Troubleshooting
+
+- *Robots never appear in the simulator:* check the robot machine can reach
+  the registry: `curl <registry-ip>:3000/api/registry`.
+- *Connection refused / timeout between machines:* allow the ports through the
+  firewall (the simulator's 3000 and the robots' 8000+). Windows: add an
+  inbound Windows Defender Firewall rule; Linux: `sudo ufw allow 3000/tcp` and
+  `sudo ufw allow 8000:8100/tcp`. Guest and campus Wi-Fi often block
+  device-to-device traffic; use a home router or phone hotspot.
+- *Campus/guest Wi-Fi blocks machines from reaching each other:* install
+  [Tailscale](https://tailscale.com/) on every machine, log in to the same
+  account, and use the registry machine's Tailscale IP (`tailscale ip -4`)
+  as `<registry-ip>`.
+- *A robot never shows up:* `docker logs lastmile-<port>` on its machine shows
+  why it can't register.
+- *A machine's IP changed:* run `python3 join.py --stop`, then join again.
+- *Simulator restarted:* running robots re-register within a few seconds and
+  keep their names.
+
+## Verify the measured-floor update
+
+The floor and the robot services share `robot/floor4.json`: 1 step = 0.50 m,
+1 tile = 0.25 m. The reference point is the hallway junction near room 418.
+Left/right wall sides are viewed walking **away from that junction**. Step
+counts are provisionally treated as hallway centerline distances; the final
+approach to a door is additional. Room dimensions and door widths are not surveyed.
+
+After pulling/editing this update, restart the dashboard and recreate existing
+robots so their containers include the navigation service. From the project root:
+
+```bash
+# Removes this project's existing robot containers on this machine.
+python3 join.py --stop
+cd simulator
+npm install
+npm run dev
+```
+
+In a second Terminal, with Docker Desktop running:
+
+```bash
+cd "/Users/ayushimistry/Desktop/AI UI prjct/LastMile"
+python3 join.py --registry "$(ipconfig getifaddr en0):3000" --count 3
+```
+
+If `en0` has no address, replace `$(ipconfig getifaddr en0)` with your active
+network IP. On macOS the dashboard also checks Docker Desktop's user socket,
+so local power controls do not require enabling the system-wide Docker socket.
+
+1. Open http://localhost:3000 and choose **OVERVIEW**. Zoom out with **−**
+   until it stops. The ground and perimeter should stay visible without fading
+   into fog. The external campus map may take time to download; the measured
+   floor works immediately even if that download fails.
+2. Choose **ECS 4F**. Door labels and the green **418 · JUNCTION · 0 m** marker
+   should appear. Use **ROOM LABELS** and **ROBOT LABELS** to toggle them.
+3. In **Measured room navigation**, select a robot and **416 · door A**.
+   Confirm **6 steps · 3.00 m · 12 tiles**, branch **left**, wall **right**.
+   Select **RETURN TO JUNCTION** first if you want every test to start at zero.
+4. Select **GO TO DOOR**. The camera follows the robot. Watch the phase change:
+   travelling → stopped at door → turning to door → approaching door → door touched.
+   The robot stops on the centerline before turning, then slowly brings its front
+   to the closed door. This is simulated geometric contact, not a physical sensor.
+5. While following, drag horizontally through a full circle, drag vertically
+   to adjust elevation, and scroll to zoom. Your orbit angle should stay stable
+   as the robot turns. **RESET BEHIND ROBOT** restores the default follow view.
+   Hallway surfaces that block the camera fade so the robot remains visible.
+6. Repeat with **408** (right/right, 5.00 m) and **402** (right/left, 7.25 m)
+   to verify opposite door-facing directions. Check **405 · door 2** at 30.00 m
+   and **413** at 27.75 m to verify both extended hallway ends.
+7. Start a long route, then **CANCEL ROUTE**. The pose should stop changing.
+   You can also inject **FAIL ROBOT** from its details: navigation pauses until
+   recovery. A robot with zero battery cannot navigate; charge and recover it.
+8. Select either bathroom: its distance remains listed, but **GO TO DOOR** is
+   disabled because branch and wall side still need confirmation. Both 416
+   entries are preserved. The close 412/414 and 407/405 door pairs have
+   explicitly provisional widths. **All measured entrances** lists all 22 entries.
+
+Automated checks (from the project root):
+
+```bash
+python3 -m unittest discover -s robot -p 'test_*.py' -v
+cd simulator
+npm run build
+```
+
+The navigation tests cover all 20 placed doors, unit conversion, heading and
+front-to-door contact, returning from a door, cancellation, and rejecting
+unplaced or unknown destinations. Measured navigation is independent of the
+unfinished LLM task console.
