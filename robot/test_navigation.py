@@ -1,5 +1,8 @@
+import asyncio
 import math
+import time
 import unittest
+from unittest import mock
 
 from navigation import CENTER_U, DOORS, FLOOR, Navigator, angle_difference, door_target
 
@@ -86,6 +89,101 @@ class NavigationTests(unittest.TestCase):
         nav.start("408")
         self.complete(nav)
         self.assertEqual(nav.mission["phase"], "door_touched")
+
+    def test_sim_navigator_defaults_match_floor_speeds(self):
+        nav = Navigator()
+        self.assertEqual(nav.speed, FLOOR["robot"]["speed"])
+        self.assertEqual(nav.turn_speed, FLOOR["robot"]["turnSpeed"])
+        # Same route timing as before: 407-1 finishes and touches the door.
+        nav.start("407-1")
+        self.complete(nav)
+        self.assertEqual(nav.mission["phase"], "door_touched")
+        self.assertEqual(nav.command, (0.0, 0.0))
+
+    def test_reversing_out_of_door_uses_negative_throttle(self):
+        nav = Navigator(power=0.3)
+        nav.start("408")
+        self.complete(nav)
+        nav.start("407-1")
+        nav.tick(0.05)
+        self.assertEqual(nav.mission["phase"], "returning_to_centerline")
+        self.assertLess(nav.command[0], 0)
+        self.assertEqual(nav.command[1], 0.0)
+
+
+class RealCarNavigationTests(unittest.TestCase):
+    """navigation_loop drives the motors when a real driver is active."""
+
+    def setUp(self):
+        import app
+        self.app = app
+        patches = [
+            mock.patch.object(app.motors, "DRIVER", "jetracer"),
+            mock.patch.object(app.motors, "set_drive"),
+            mock.patch.dict(app.state, {"status": "alive", "battery": 100.0}),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.set_drive = app.motors.set_drive
+        self.nav = app.make_navigator()
+        p = mock.patch.object(app, "navigator", self.nav)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_loop(self, seconds, until=None):
+        async def main():
+            loop = asyncio.create_task(self.app.navigation_loop())
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline and not (until and until()):
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.12)  # let the loop send its stop
+            loop.cancel()
+        asyncio.run(main())
+
+    def test_407_command_sequence(self):
+        # Speed up the car's calibration so the route runs quickly in the test.
+        self.nav.speed *= 40
+        self.nav.turn_speed *= 40
+        self.nav.start("407-1")
+        self.run_loop(20, until=lambda: not self.nav.queue)
+        self.assertEqual(self.nav.mission["phase"], "door_touched")
+        calls = [c.args for c in self.set_drive.call_args_list]
+        sequence = [calls[0]]
+        for c in calls[1:]:
+            if c != sequence[-1]:
+                sequence.append(c)
+        power = self.app.MOTOR_POWER
+        slow = power * 0.18 / FLOOR["robot"]["speed"]
+        expected = [(0.0, 0.0), (power, 0.0), (0.0, 0.0), (power, 1.0), (slow, 0.0), (0, 0)]
+        # Zero-length back-out at the junction, hallway travel (+v from the junction), pause, right turn (heading -pi/2), slow approach, stop.
+        self.assertEqual(door_target("407-1")["heading"], -math.pi / 2)
+        self.assertEqual(len(sequence), len(expected), sequence)
+        for got, want in zip(sequence, expected):
+            self.assertAlmostEqual(got[0], want[0])
+            self.assertAlmostEqual(got[1], want[1])
+
+    def test_cancel_stops_motors_immediately(self):
+        from fastapi.testclient import TestClient
+        self.nav.start("407-1")
+        self.nav.tick(0.05)
+        self.set_drive.reset_mock()
+        TestClient(self.app.app).post("/navigate", json={"cancel": True})
+        self.set_drive.assert_called_with(0, 0)
+        self.assertEqual(self.nav.mission["phase"], "cancelled")
+
+    def test_dead_battery_stops_motors(self):
+        self.nav.start("407-1")
+        self.app.state["battery"] = 0
+        self.run_loop(0.2)
+        self.set_drive.assert_called_with(0, 0)
+        self.assertNotIn(mock.call(self.app.MOTOR_POWER, 0.0), self.set_drive.call_args_list)
+
+    def test_sim_driver_never_commands_motors(self):
+        with mock.patch.object(self.app.motors, "DRIVER", "sim"):
+            self.nav.start("407-1")
+            self.run_loop(0.3)
+        self.set_drive.assert_not_called()
 
 
 if __name__ == "__main__":

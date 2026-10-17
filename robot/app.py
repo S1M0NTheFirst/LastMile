@@ -44,7 +44,26 @@ DRIVE_LIMITS = {"forward": MAX_DRIVE_METERS, "backward": MAX_DRIVE_METERS, "left
 METERS_PER_UNIT = 2.0  # the dashboard's 0-100 grid spans 200 m
 
 app = FastAPI(title="Robot")
-navigator = Navigator()
+
+
+def make_navigator() -> Navigator:
+    """Simulated robots use the floor's own speeds; a real car integrates the
+    route at its drive calibration (step_rate) so map timing matches the motors."""
+    if motors.DRIVER == "sim":
+        return Navigator()
+    return Navigator(
+        speed=step_rate({"action": "forward", "speed": MOTOR_POWER}),
+        turn_speed=math.radians(step_rate({"action": "left", "speed": MOTOR_POWER})),
+        power=MOTOR_POWER,
+    )
+
+
+def stop_motors():
+    try:
+        motors.set_drive(0, 0)
+    except RuntimeError:
+        pass  # bridge unreachable: its watchdog stops the car
+
 
 state = {
     "id": None,             # assigned by the registry
@@ -59,8 +78,8 @@ state = {
                  "y": round(random.uniform(0, 100), 1)},
     "heading": 90.0,        # degrees, counter-clockwise from east; 90 = facing north (+y)
     "inbox": [],            # messages received from peers
-    "pose": navigator.pose, # authoritative floor-local meters and heading
-    "navigation": navigator.mission,
+    "pose": None,           # authoritative floor-local meters and heading
+    "navigation": None,
     "floor_version": "measured-v1",
 }
 tasks: dict[str, dict] = {}
@@ -211,10 +230,22 @@ async def navigation_loop():
         await asyncio.sleep(0.05)
         now = time.monotonic()
         dt, previous = min(now - previous, 0.15), now
-        if responsive() and state["battery"] > 0:
+        can_drive = responsive() and state["battery"] > 0
+        if can_drive:
             navigator.tick(dt)
         state["navigation"] = navigator.mission
         navigating = bool(navigator.queue)
+        if motors.DRIVER != "sim" and (navigating or was_navigating):
+            # Re-sent every tick: the motor bridge stops the car when commands stop.
+            if can_drive and navigating:
+                try:
+                    motors.set_drive(*navigator.command)
+                except RuntimeError as exc:
+                    print(f"navigation stopped: {exc}", flush=True)
+                    navigator.cancel()
+                    stop_motors()
+            else:
+                stop_motors()
         # Only take over mode/position while a floor route is active, so the
         # battery and drive logic keep control the rest of the time.
         if navigating:
@@ -409,6 +440,11 @@ def step_rate(step: dict) -> float:
     """Meters (or degrees) per second for one step, scaled from the calibration."""
     base = DRIVE_SPEED if step["action"] in ("forward", "backward") else TURN_SPEED
     return base * step["speed"] / MOTOR_POWER
+
+
+navigator = make_navigator()
+state["pose"] = navigator.pose
+state["navigation"] = navigator.mission
 
 
 def drive_seconds(steps: list[dict]) -> float:
@@ -639,6 +675,8 @@ class NavigationRequest(BaseModel):
 async def navigate(req: NavigationRequest):
     if req.cancel:
         navigator.cancel()
+        if motors.DRIVER != "sim":
+            stop_motors()
     else:
         if not responsive() or state["battery"] <= 0:
             raise HTTPException(status_code=409, detail="Recover and charge the robot before navigating")
