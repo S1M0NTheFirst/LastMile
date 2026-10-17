@@ -13,6 +13,7 @@ import time
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from navigation import Navigator, FLOOR
 
 # Registry address, e.g. "192.168.1.132:3000" (the machine running the simulator).
 REGISTRY = os.getenv("REGISTRY", "")
@@ -23,6 +24,7 @@ HOST_PORT = int(os.getenv("HOST_PORT", "0"))
 DRAIN_RATE = float(os.getenv("DRAIN_RATE", "0.1"))
 
 app = FastAPI(title="Robot")
+navigator = Navigator()
 
 state = {
     "id": None,             # assigned by the registry
@@ -32,6 +34,11 @@ state = {
     "position": {"x": round(random.uniform(0, 100), 1),
                  "y": round(random.uniform(0, 100), 1)},
     "inbox": [],            # messages received from peers
+    "pose": navigator.pose, # authoritative floor-local meters and heading
+    "navigation": navigator.mission,
+    "mode": "idle",
+    "accepting_tasks": True,
+    "floor_version": "measured-v1",
 }
 
 
@@ -43,10 +50,28 @@ def _responsive() -> bool:
 async def _battery_loop():
     while True:
         await asyncio.sleep(1)
-        if state["status"] != "dead" and state["battery"] > 0:
+        if state["status"] != "dead":
             state["battery"] = max(0.0, state["battery"] - DRAIN_RATE)
             if state["battery"] == 0:
                 state["status"] = "dead"
+
+
+async def _navigation_loop():
+    previous = time.monotonic()
+    while True:
+        await asyncio.sleep(0.05)
+        now = time.monotonic()
+        dt, previous = min(now - previous, 0.15), now
+        if _responsive() and state["battery"] > 0:
+            navigator.tick(dt)
+        state["navigation"] = navigator.mission
+        state["mode"] = navigator.mission["phase"] if navigator.queue else "idle"
+        state["accepting_tasks"] = _responsive() and state["battery"] > 0 and not navigator.queue
+        g = FLOOR["geometry"]
+        state["position"] = {
+            "x": (navigator.pose["v"] - g["leftEnd"]) / (g["rightEnd"] - g["leftEnd"]) * 100,
+            "y": (navigator.pose["u"] + 1) / (g["junctionFar"] + 1) * 100,
+        }
 
 
 async def _register_loop():
@@ -89,6 +114,7 @@ async def _startup():
         raise RuntimeError("REGISTRY, HOST_IP and HOST_PORT must be set (use join.py)")
     asyncio.create_task(_battery_loop())
     asyncio.create_task(_register_loop())
+    asyncio.create_task(_navigation_loop())
 
 
 # ---- observability ----------------------------------------------------------
@@ -170,4 +196,32 @@ def control(ctrl: Control):
         state["status"] = ctrl.status
     if ctrl.battery is not None:
         state["battery"] = max(0.0, min(100.0, ctrl.battery))
+        if state["battery"] == 0:
+            state["status"] = "dead"
+    return state
+
+
+class NavigationRequest(BaseModel):
+    door_id: str | None = None
+    cancel: bool = False
+
+
+@app.post("/navigate")
+async def navigate(req: NavigationRequest):
+    if req.cancel:
+        navigator.cancel()
+    else:
+        if not _responsive() or state["battery"] <= 0:
+            raise HTTPException(status_code=409, detail="Recover and charge the robot before navigating")
+        if navigator.queue:
+            raise HTTPException(status_code=409, detail="Cancel the current route before choosing another door")
+        if not req.door_id:
+            raise HTTPException(status_code=400, detail="door_id is required")
+        try:
+            navigator.start(req.door_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Unknown door")
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+    state["navigation"] = navigator.mission
     return state
