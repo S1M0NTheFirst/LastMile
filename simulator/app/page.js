@@ -1234,6 +1234,13 @@ const ZOOM = {
   follow: { min: 0.25, max: 5 }, // multiplier on the default follow offset
   pov: { minFov: 12, maxFov: 90 },
 };
+// Panning slides the camera and the point it looks at together, along the ground, so the
+// viewing angle never changes. Speeds scale with zoom: zoomed out pans farther.
+const PAN = {
+  speed: 0.6, // while a pan button / key is held: fraction of the camera distance per second
+  tap: 0.08, // a single tap: fraction of the camera distance
+  limit: WORLD_RADIUS * 1.3, // how far from ECS the view center may wander
+};
 
 async function post(url, body) {
   const res = await fetch(url, {
@@ -1618,6 +1625,9 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     const pW = new THREE.Vector3();
     const qW = new THREE.Quaternion();
     const fwd = new THREE.Vector3();
+    const panRight = new THREE.Vector3();
+    const panAhead = new THREE.Vector3();
+    const panDelta = new THREE.Vector3();
     const tmp = new THREE.Vector3();
     const origin = new THREE.Vector3();
     const homeDist = HOME.length();
@@ -1757,6 +1767,47 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         cam.updateProjectionMatrix();
       }
 
+      // Panning (buttons, keys, or drag). Ignored while the camera is locked to a robot.
+      const pan = z.pan;
+      if (tracking) {
+        pan.impulse.x = pan.impulse.y = 0;
+      } else {
+        const dist = cam.position.distanceTo(controls.target);
+        let mx = ((pan.held.right ? 1 : 0) - (pan.held.left ? 1 : 0)) * PAN.speed * dist * dt;
+        let my = ((pan.held.up ? 1 : 0) - (pan.held.down ? 1 : 0)) * PAN.speed * dist * dt;
+        for (const k of ["x", "y"]) {
+          if (!pan.impulse[k]) continue;
+          const step = Math.abs(pan.impulse[k]) < 1e-3 ? pan.impulse[k] : pan.impulse[k] * 0.25; // ease taps in
+          pan.impulse[k] -= step;
+          if (k === "x") mx += step * dist;
+          else my += step * dist;
+        }
+        if (mx || my) {
+          returning = false; // a manual pan takes over from the ease to a preset view
+          // Screen-right and screen-up, flattened onto the ground.
+          panRight.setFromMatrixColumn(cam.matrixWorld, 0).setY(0).normalize();
+          cam.getWorldDirection(panAhead).setY(0);
+          if (panAhead.lengthSq() < 1e-6) panAhead.setFromMatrixColumn(cam.matrixWorld, 1).setY(0); // looking straight down
+          panAhead.normalize();
+          panDelta.copy(panRight).multiplyScalar(mx).addScaledVector(panAhead, my);
+          cam.position.add(panDelta);
+          controls.target.add(panDelta);
+        }
+        // Keep the view center near the campus, whichever way it was panned (including drag).
+        const r = Math.hypot(controls.target.x, controls.target.z);
+        if (r > PAN.limit) {
+          const k = (r - PAN.limit) / r;
+          panDelta.set(-controls.target.x * k, 0, -controls.target.z * k);
+          cam.position.add(panDelta);
+          controls.target.add(panDelta);
+        }
+      }
+      // Drag mode: left-drag / one-finger drag pans instead of rotating (right-drag does the other).
+      const panDrag = z.panDrag;
+      controls.mouseButtons.LEFT = panDrag ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE;
+      controls.mouseButtons.RIGHT = panDrag ? THREE.MOUSE.ROTATE : THREE.MOUSE.PAN;
+      controls.touches.ONE = panDrag ? THREE.TOUCH.PAN : THREE.TOUCH.ROTATE;
+
       controls.enabled = !tracking && !returning;
       if (mode === "follow" && sel) {
         const radius = (indoors ? 5.3 : 9) * followMul;
@@ -1856,7 +1907,9 @@ export default function Page() {
   const uiRef = useRef({ view, trails, selected });
   const onPick = useRef(null);
   const onWorld = useRef(setWorld);
-  const zoomRef = useRef({ pending: 0, reset: false });
+  // Camera requests from the UI: zoom steps, and pan buttons/keys held or tapped.
+  const zoomRef = useRef({ pending: 0, reset: false, pan: { held: {}, impulse: { x: 0, y: 0 } }, panDrag: false });
+  const [panDrag, setPanDragState] = useState(false);
   const [floorInfo, setFloorInfo] = useState(null);
   const onFloor = useRef(setFloorInfo);
   const onZoom = useRef(setZoomLevel);
@@ -1905,19 +1958,60 @@ export default function Page() {
     zoomRef.current.reset = true;
   }
 
+  // dir: "left" | "right" | "up" | "down". Starting a pan also gives a small tap-sized nudge,
+  // so a quick click moves a little and holding keeps moving.
+  const PAN_TAP = { left: [-1, 0], right: [1, 0], up: [0, 1], down: [0, -1] };
+  function panStart(dir) {
+    const p = zoomRef.current.pan;
+    if (!p.held[dir]) {
+      p.impulse.x += PAN_TAP[dir][0] * PAN.tap;
+      p.impulse.y += PAN_TAP[dir][1] * PAN.tap;
+    }
+    p.held[dir] = true;
+  }
+  function panStop(dir) {
+    zoomRef.current.pan.held[dir] = false;
+  }
+  function setPanDrag(on) {
+    zoomRef.current.panDrag = on;
+    setPanDragState(on);
+  }
+  // Panning only applies when the camera isn't locked to a robot.
+  const panLocked = (view === "follow" || view === "pov") && !!selected;
+
   // Keyboard: + / = zoom in, - zoom out, 0 resets. Ignored while typing in the task console.
   useEffect(() => {
+    // Arrow keys and WASD pan while held.
+    const PAN_KEYS = { ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right", ArrowUp: "up", w: "up", ArrowDown: "down", s: "down" };
+    const panKey = (e) => PAN_KEYS[e.key.length === 1 ? e.key.toLowerCase() : e.key];
     function onKey(e) {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.target.closest?.("input, textarea, select, [contenteditable]")) return;
-      if (e.key === "+" || e.key === "=") zoomIn();
+      const dir = panKey(e);
+      if (dir) {
+        if (!e.repeat) panStart(dir);
+      } else if (e.key === "+" || e.key === "=") zoomIn();
       else if (e.key === "-" || e.key === "_") zoomOut();
       else if (e.key === "0") zoomReset();
       else return;
       e.preventDefault();
     }
+    function onKeyUp(e) {
+      const dir = panKey(e);
+      if (dir) panStop(dir);
+    }
+    // Releasing keys while the window is in the background never fires keyup; stop everything.
+    function onBlur() {
+      zoomRef.current.pan.held = {};
+    }
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
   }, []);
 
   function log(text) {
@@ -2302,6 +2396,28 @@ export default function Page() {
           <button className="btn" style={{ marginTop: 6 }} onClick={reloadMap}>RETRY</button>
         </div>
       )}
+
+      <div className={`pan-pad ${panLocked ? "locked" : ""}`} role="group" aria-label="Pan the view"
+        title={panLocked ? "Panning is off while the camera follows a robot" : "Pan: hold an arrow, or use the arrow keys / WASD"}>
+        <div className="pan-grid">
+          {[["up", "▲", "Pan up (↑ / W)"], ["left", "◀", "Pan left (← / A)"], ["center", "⌖", "Recenter view (0)"], ["right", "▶", "Pan right (→ / D)"], ["down", "▼", "Pan down (↓ / S)"]].map(
+            ([dir, icon, tip]) =>
+              dir === "center" ? (
+                <button key={dir} className="btn pan-center" disabled={panLocked} onClick={zoomReset} title={tip} aria-label={tip}>{icon}</button>
+              ) : (
+                <button key={dir} className={`btn pan-${dir}`} disabled={panLocked} title={tip} aria-label={tip}
+                  onPointerDown={(e) => { e.currentTarget.setPointerCapture?.(e.pointerId); panStart(dir); }}
+                  onPointerUp={() => panStop(dir)} onPointerCancel={() => panStop(dir)} onLostPointerCapture={() => panStop(dir)}>
+                  {icon}
+                </button>
+              )
+          )}
+        </div>
+        <button className={`btn pan-drag ${panDrag ? "active" : ""}`} disabled={panLocked} onClick={() => setPanDrag(!panDrag)}
+          title="Choose what a left-drag (or one-finger drag) does; right-drag always does the other">
+          DRAG: {panDrag ? "PAN" : "ROTATE"}
+        </button>
+      </div>
 
       <div className="legend">
         <span><i className="dot" style={{ background: "#45d5a2" }} />alive</span>
