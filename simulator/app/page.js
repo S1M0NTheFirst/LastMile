@@ -8,6 +8,11 @@ import { FLOOR_DATA, CENTER_U, DOORS, doorFeatures } from "./lib/floor4";
 const FINAL = ["completed", "failed", "cancelled", "reassigned"];
 const COLORS = { alive: 0x45d5a2, no_response: 0xffc06b, dead: 0xff7684, off: 0x5b636f, busy: 0x6aaaff };
 const TRAIL_MAX = 300;
+// Robot positions are polled this often and played back this far behind real time, so
+// the dashboard always has two samples to glide between instead of jumping to each one.
+const POSITION_POLL_MS = 250;
+const PLAYBACK_DELAY_MS = 450;
+const MAX_SAMPLE_JUMP = 60; // meters between samples beyond which a robot is moved, not glided
 
 // Fleet status as shown in the UI: off / no_response / dead / alive.
 function robotStatus(r) {
@@ -1426,7 +1431,19 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       for (const m of meshes.values()) m.reset = true; // jump to the new space, restart trails
     }
 
+    // Timestamped positions, one per poll, for gliding between them (see stepRobot).
+    let lastRobots = null;
+    function addSample(m, sample) {
+      const last = m.samples[m.samples.length - 1];
+      if (last && Math.hypot(last.x - sample.x, last.z - sample.z) > MAX_SAMPLE_JUMP) m.samples = [];
+      m.samples.push(sample);
+      if (m.samples.length > 24) m.samples.shift();
+    }
+
     function syncMeshes() {
+      const fresh = robotsRef.current !== lastRobots; // a new poll arrived
+      lastRobots = robotsRef.current;
+      const sampleTime = performance.now();
       const want = uiRef.current.robotSpace === "hallway" && floor.group ? "hallway" : "campus";
       // Robots still out on campus are not drawn inside the 4th-floor hallways.
       const robots = want === "hallway"
@@ -1451,16 +1468,23 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
           m = buildRobotMesh(robotLayer, r.name);
           m.group.userData.name = r.name;
           m.reset = true;
+          m.samples = [];
           meshes.set(r.name, m);
         }
         m.hex = robotHex(r);
         m.authoritative = robotSpace === "hallway" && r.state?.pose?.space === "floor4";
-        if (m.authoritative) {
-          m.heading = r.state.pose.heading;
+        if (m.authoritative || robotSpace === "campus") {
           m.target = target;
           m.route = [];
-          if (m.reset) m.group.position.set(target.x, 0, target.z);
+          if (m.reset) {
+            m.group.position.set(target.x, 0, target.z);
+            m.samples = [];
+            m.trail = [];
+          }
           m.reset = false;
+          if (fresh || !m.samples.length) {
+            addSample(m, { t: sampleTime, x: target.x, z: target.z, h: m.authoritative ? r.state.pose.heading : undefined });
+          }
           const previous = m.trail[m.trail.length - 1];
           if (!previous || Math.hypot(previous[0] - target.x, previous[1] - target.z) > 0.03) {
             m.trail.push([target.x, target.z]);
@@ -1497,10 +1521,25 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
 
     // Moves a robot along its route; faster when far behind, so it keeps up with updates.
     function stepRobot(m, dt) {
-      if (m.authoritative) {
-        const alpha = 1 - Math.exp(-12 * dt);
-        m.group.position.x = THREE.MathUtils.lerp(m.group.position.x, m.target.x, alpha);
-        m.group.position.z = THREE.MathUtils.lerp(m.group.position.z, m.target.z, alpha);
+      if (m.samples?.length) {
+        // Play the polled positions back slightly late, at the speed they really changed.
+        const t = performance.now() - PLAYBACK_DELAY_MS;
+        const ss = m.samples;
+        let i = ss.length - 1;
+        while (i > 0 && ss[i - 1].t > t) i--;
+        const a = ss[Math.max(0, i - 1)], b = ss[i];
+        const f = b.t > a.t ? THREE.MathUtils.clamp((t - a.t) / (b.t - a.t), 0, 1) : 1;
+        const x = a.x + (b.x - a.x) * f, z = a.z + (b.z - a.z) * f;
+        const pos = m.group.position;
+        if (b.h !== undefined) {
+          // Floor robots report their heading; take the short way between the two samples.
+          const ah = a.h ?? b.h;
+          m.heading = ah + Math.atan2(Math.sin(b.h - ah), Math.cos(b.h - ah)) * f;
+        } else if (Math.hypot(x - pos.x, z - pos.z) > 1e-3) {
+          m.heading = Math.atan2(-(z - pos.z), x - pos.x); // robot's long (+x) axis faces travel
+        }
+        pos.x = x;
+        pos.z = z;
         return;
       }
       if (!m.route?.length) return;
@@ -1957,7 +1996,6 @@ export default function Page() {
   const seenMsgs = useRef(new Set());
   const toastTimer = useRef(null);
 
-  robotsRef.current = robots;
   uiRef.current = { view, trails, selected, robotSpace, robotLabels, roomLabels, doorId };
   onPick.current = (name) => {
     setSelected(name);
@@ -2024,10 +2062,27 @@ export default function Page() {
     toastTimer.current = setTimeout(() => setToastText(""), 1400);
   }
 
+  // Newest fleet snapshot wins, so a slow response can't move robots backwards.
+  const fleetStarted = useRef(0);
+  async function fetchFleet() {
+    const started = performance.now();
+    const res = await fetch("/api/fleet", { cache: "no-store" });
+    const data = await res.json();
+    if (!data.error && started > fleetStarted.current) {
+      fleetStarted.current = started;
+      robotsRef.current = data.robots; // the 3D view reads this every frame
+    }
+    return data;
+  }
+
+  useEffect(() => {
+    const id = setInterval(() => fetchFleet().catch(() => {}), POSITION_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
   async function refresh() {
     try {
-      const res = await fetch("/api/fleet", { cache: "no-store" });
-      const data = await res.json();
+      const data = await fetchFleet();
       if (data.error) return setError(data.error);
       setError(null);
       setRobots(data.robots);
