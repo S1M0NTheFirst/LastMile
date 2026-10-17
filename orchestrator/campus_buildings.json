@@ -1,0 +1,78 @@
+{
+ "Beach Buildling Services": {
+  "x": 91.5,
+  "y": 53.3
+ },
+ "College of Professional and Continuing Education": {
+  "x": 25.4,
+  "y": 6.8
+ },
+ "Corporation Yard": {
+  "x": 69.5,
+  "y": 61.4
+ },
+ "Design": {
+  "x": 73.2,
+  "y": 8.1
+ },
+ "ECS Engineering & Computer Science": {
+  "x": 50.0,
+  "y": 50.0
+ },
+ "Engineering 2": {
+  "x": 40.3,
+  "y": 40.2
+ },
+ "Engineering 3": {
+  "x": 32.0,
+  "y": 53.5
+ },
+ "Engineering 4": {
+  "x": 41.6,
+  "y": 53.5
+ },
+ "Engineering Technology": {
+  "x": 72.8,
+  "y": 31.3
+ },
+ "Human Services and Design": {
+  "x": 67.7,
+  "y": 27.1
+ },
+ "MS": {
+  "x": 60.8,
+  "y": 52.5
+ },
+ "Outpost": {
+  "x": 48.1,
+  "y": 17.2
+ },
+ "Outpost: Beach Convenience Shop": {
+  "x": 44.1,
+  "y": 18.9
+ },
+ "Reprographics / Print Shop": {
+  "x": 92.4,
+  "y": 71.4
+ },
+ "Shipping & Receiving": {
+  "x": 76.5,
+  "y": 46.8
+ },
+ "Social Science / Public Affairs": {
+  "x": 43.6,
+  "y": 7.7
+ },
+ "Student Recreation and Wellness Center": {
+  "x": 78.2,
+  "y": 94.1
+ },
+ "University Police": {
+  "x": 76.3,
+  "y": 72.2
+ },
+ "Vivian Engineering Center": {
+  "x": 45.3,
+  "y": 30.1
+ }
+}

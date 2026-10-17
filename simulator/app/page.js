@@ -2248,7 +2248,7 @@ export default function Page() {
             onChange={(e) => setGoal(e.target.value)}
             placeholder="Deliver package P123 to the north entrance"
           />
-          <div className="sub" style={{ marginBottom: 6 }}>north/east/west/south entrance · warehouse · main door · building a · ECS rooms (407) · try: deliver P1 from building a to 407 · robot3 forward 1 m, turn left · robot3 drive until you see a door</div>
+          <div className="sub" style={{ marginBottom: 6 }}>north/east/west/south entrance · warehouse · main door · College of Professional and Continuing Education (CPaCE) · ECS rooms (407) · try: deliver P1 from CPaCE to 407 · robot3 forward 1 m, turn left · robot3 drive until you see a door</div>
           <button className="btn" disabled={submitting || !goal.trim()}>{submitting ? "THINKING…" : "SEND TASK"}</button>
           {missionTask && !FINAL.includes(missionTask.status) && (
             <button type="button" className="btn danger" style={{ marginLeft: 6 }} onClick={() => cancelTask(missionTask.task_id)}>

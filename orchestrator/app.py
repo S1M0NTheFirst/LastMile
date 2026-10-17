@@ -49,11 +49,15 @@ KNOWN_LOCATIONS = {
     "south entrance": {"x": 50.0, "y": 10.0},
     "warehouse": {"x": 20.0, "y": 80.0},
     "main door": {"x": 50.0, "y": 10.0},
-    # Placeholder pickup building for the handoff demo; rename or move freely.
-    "building a": {"x": 20.0, "y": 25.0},
     # The building with the measured 4th floor; the dashboard centers on it.
     "ecs": {"x": 50.0, "y": 50.0},
 }
+# Every named OpenStreetMap building on the dashboard's campus map, at its OSM
+# centroid on the 0-100 grid (ECS at 50,50, 4 m per unit, +y north). Built from
+# the same Overpass data the dashboard draws, so names match the map labels.
+CAMPUS_BUILDINGS = json.loads((Path(__file__).resolve().parent / "campus_buildings.json").read_text())
+for building_name, spot in CAMPUS_BUILDINGS.items():
+    KNOWN_LOCATIONS.setdefault(building_name.lower(), {"x": spot["x"], "y": spot["y"]})
 METERS_PER_UNIT = 2.0  # the dashboard's 0-100 grid spans 200 m
 
 
@@ -82,6 +86,12 @@ LOCATION_ALIASES = {
     "west gate": "west entrance",
     "south gate": "south entrance",
     "front door": "main door",
+    "building a": "college of professional and continuing education",
+    "cpace": "college of professional and continuing education",
+    "vec": "vivian engineering center",
+    "rec center": "student recreation and wellness center",
+    "srwc": "student recreation and wellness center",
+    "ecs engineering & computer science": "ecs",
 }
 tasks: dict[str, dict] = {}
 # Robot name -> its last /state that answered, so a killed robot's spot is known.
@@ -161,6 +171,10 @@ def resolve_destination(destination: str):
         if door_id:
             return {"name": f"room {door_id.split('-')[0]}", **KNOWN_LOCATIONS["ecs"],
                     "space": "floor4", "door_id": door_id}
+    # A partial building name the LLM shortened, e.g. "engineering technology building".
+    partial = [n for n in KNOWN_LOCATIONS if len(normalized) >= 4 and (normalized in n or n in normalized)]
+    if len(partial) == 1:
+        return {"name": partial[0], **KNOWN_LOCATIONS[partial[0]]}
     coordinates = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", normalized)
     if coordinates:
         return {"name": destination, "x": float(coordinates.group(1)), "y": float(coordinates.group(2))}
@@ -373,7 +387,7 @@ async def assign_delivery_task(
     if isinstance(pickup, str) and pickup.strip():
         pickup = {**resolve_destination(pickup), "space": "campus"}
         if pickup.get("door_id"):
-            raise HTTPException(status_code=400, detail="pickup must be a campus location such as building a")
+            raise HTTPException(status_code=400, detail="pickup must be a campus location such as college of professional and continuing education")
     if pickup:
         payload["pickup"] = pickup
     # The robot nearest the package (pickup spot, else the destination) takes it.
@@ -461,7 +475,7 @@ def gemini_tools():
                 },
                 "pickup": {
                     "type": "string",
-                    "description": "Optional known location where the package is picked up first, such as building a.",
+                    "description": "Optional known location where the package is picked up first, such as college of professional and continuing education.",
                 },
                 "minimum_battery": {"type": "number", "description": "Minimum battery percentage."},
                 "robot_id": {"type": "string", "description": "Optional preferred robot ID."},
@@ -754,9 +768,11 @@ async def chat(req: ChatRequest):
         "available robot and explain the handoff. If the request is unrelated, "
         "explain that only move, drive, and package-delivery tasks are currently supported. "
         "Known locations include north entrance, east entrance, west entrance, "
-        "south entrance, warehouse, main door, building a, and ecs. Rooms on the ECS "
+        f"south entrance, warehouse, main door, and these campus buildings: {', '.join(CAMPUS_BUILDINGS)} "
+        "(cpace = College of Professional and Continuing Education, vec = Vivian Engineering Center). "
+        "Any of them can be a pickup or a destination. Rooms on the ECS "
         "4th floor (for example 407) are delivery destinations: pass the room number as "
-        "destination, and pass where the package comes from (for example building a) as "
+        "destination, and pass where the package comes from (for example cpace) as "
         "pickup. If a robot dies mid-delivery the system hands the package to the robot "
         "closest to where it died. The map uses "
         "x and y from 0 to 100; interpret top "
