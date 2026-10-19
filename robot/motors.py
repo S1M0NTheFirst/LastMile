@@ -67,3 +67,37 @@ async def bridge_get(path: str, timeout: float = 6.0) -> httpx.Response:
             detail = response.text
         raise RuntimeError(f"motor bridge {path}: {detail}")
     return response
+
+
+async def bridge_stream(path: str):
+    """Open a streaming GET on the bridge: returns (content_type, async byte iterator)."""
+    if DRIVER == "sim":
+        raise RuntimeError("this robot has no hardware (MOTOR_DRIVER=sim)")
+    token = os.getenv("ROBOT_AUTH_TOKEN", "")
+    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=10.0))
+    try:
+        request = client.build_request(
+            "GET", f"{BRIDGE_URL}{path}",
+            headers={"Authorization": f"Bearer {token}"} if token else {},
+        )
+        response = await client.send(request, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise RuntimeError(f"motor bridge at {BRIDGE_URL} unreachable ({exc!r})") from exc
+    if response.status_code != 200:
+        detail = (await response.aread()).decode(errors="replace")
+        await response.aclose()
+        await client.aclose()
+        raise RuntimeError(f"motor bridge {path}: {detail}")
+
+    async def chunks():
+        try:
+            async for chunk in response.aiter_raw():
+                yield chunk
+        except httpx.HTTPError:
+            pass  # bridge stopped sending: end the stream
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return response.headers["content-type"], chunks()

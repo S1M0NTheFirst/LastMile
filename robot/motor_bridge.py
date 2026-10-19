@@ -6,14 +6,22 @@ with MOTOR_DRIVER=jetracer it talks to this server over HTTP instead:
     ROBOT_AUTH_TOKEN=lastmile-local-secret python3 motor_bridge.py
 
     POST /drive        {"throttle": -1..1, "steering": -1..1}
+    POST /trim         {"offset": -0.1}, moves "straight" to fix wheels that rest off-center
     GET  /battery      {"voltage": 11.8, "percent": 78}, from the INA219 chip
     GET  /camera.jpg   the latest camera frame
+    GET  /camera.mjpg  the camera as a continuous video stream (what the dashboard shows)
 
 Uses only the standard library plus `jetracer` (and smbus / OpenCV, which the
 Waveshare image ships, for the battery and camera), and works with the Jetson's
 stock Python 3.6. For safety the car stops whenever no command arrives for half
 a second (the robot re-sends its command ten times a second while driving), so
 a crashed container or a dropped network connection never leaves it running.
+
+If the wheels rest off-center, try values with POST /trim until they point
+straight, then start the bridge with STEERING_OFFSET=<that value>:
+
+    curl -X POST -H "Authorization: Bearer $ROBOT_AUTH_TOKEN" \\
+      -d '{"offset": -0.1}' http://localhost:8090/trim
 
 If the wheels steer the wrong way, start it with FLIP_STEERING=1; if they
 spin backward on a forward command, add FLIP_THROTTLE=1; if the picture is
@@ -24,6 +32,9 @@ opened it, and if it still fails run `sudo systemctl restart nvargus-daemon`.
 """
 import json
 import os
+import struct
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -42,10 +53,9 @@ INA219_BUS = int(os.getenv("INA219_BUS", "1"))
 INA219_ADDR = int(os.getenv("INA219_ADDR", "0x41"), 16)
 BATTERY_FULL_V = float(os.getenv("BATTERY_FULL_V", "12.6"))
 BATTERY_EMPTY_V = float(os.getenv("BATTERY_EMPTY_V", "9.0"))
-CAMERA_WIDTH, CAMERA_HEIGHT = 640, 360
-CAMERA_JPEG_QUALITY = int(os.getenv("CAMERA_JPEG_QUALITY", "65"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+CAMERA_STREAM_FPS = int(os.getenv("CAMERA_STREAM_FPS", "12"))
 CAMERA_IDLE_SECONDS = 10  # release the camera this long after the last request
-CAMERA_FLIP = 2 if os.getenv("FLIP_CAMERA") else 0  # nvvidconv flip-method 2 = rotate 180
 
 car = NvidiaRacecar()
 # The jetracer library scales throttle by throttle_gain (0.8 by default), so
@@ -55,6 +65,31 @@ if os.getenv("THROTTLE_GAIN"):
 lock = threading.Lock()
 last_command = 0.0
 moving = False
+
+
+def refresh_steering():
+    """Re-send the current steering to the servo.
+
+    The library only moves the servo when `car.steering` changes, so after
+    changing steering_offset the servo would not move until the next turn.
+    """
+    current = car.steering
+    car.steering = current + 1e-6
+    car.steering = current
+
+
+def set_trim(offset):
+    """Set where "straight" is (the library's steering_offset) and move the servo there."""
+    limit = max(0.0, 1.0 - abs(car.steering_gain))  # beyond this, full lock would exceed the servo range
+    if abs(offset) > limit:
+        raise ValueError("offset must be between -{0:g} and {0:g}".format(limit))
+    with lock:
+        car.steering_offset = offset
+        refresh_steering()
+
+
+if os.getenv("STEERING_OFFSET"):
+    car.steering_offset = float(os.getenv("STEERING_OFFSET"))
 
 
 def set_drive(throttle, steering):
@@ -93,77 +128,80 @@ def read_battery():
 
 
 class Camera:
-    """Keeps reading the CSI camera in the background so a frame is always fresh.
+    """Latest camera frame, read from a helper process (camera_worker.py).
 
-    Opened on the first request and released CAMERA_IDLE_SECONDS after the last
-    one, so the Nano's CPU (and the camera for other programs) is free whenever
-    nobody is watching.
+    The helper starts on the first request and is stopped CAMERA_IDLE_SECONDS
+    after the last one, so the Nano's CPU (and the camera for other programs) is
+    free whenever nobody is watching. If the helper crashes, the next request
+    starts a new one and this bridge keeps running.
     """
-    PIPELINE = (
-        "nvarguscamerasrc ! video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! "
-        "nvvidconv flip-method={flip} ! video/x-raw, width={w}, height={h}, format=BGRx ! "
-        "videoconvert ! video/x-raw, format=BGR ! appsink drop=true max-buffers=1"
-    )
 
     def __init__(self):
         self.lock = threading.Lock()
         self.frame = None
         self.error = None
-        self.started = False
+        self.proc = None
         self.last_request = 0.0
 
     def jpeg(self):
         with self.lock:
             self.last_request = time.time()
-            if not self.started:
-                self.started = True
+            if self.proc is None:
                 self.error = None
-                threading.Thread(target=self.run, daemon=True).start()
-        deadline = time.time() + 5  # the camera takes a few seconds to start
+                self.frame = None
+                self.proc = subprocess.Popen(
+                    [sys.executable, os.path.join(HERE, "camera_worker.py")],
+                    stdout=subprocess.PIPE,
+                )
+                threading.Thread(target=self.read_frames, args=(self.proc,), daemon=True).start()
+        deadline = time.time() + 10  # Argus takes a few seconds to start
         while time.time() < deadline:
             with self.lock:
                 frame, error = self.frame, self.error
+            if frame is not None:
+                return frame
             if error:
                 raise RuntimeError(error)
-            if frame is not None:
-                import cv2
-                ok, data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, CAMERA_JPEG_QUALITY])
-                if not ok:
-                    raise RuntimeError("could not encode the camera frame")
-                return data.tobytes()
             time.sleep(0.05)
-        raise RuntimeError("camera gave no frame within 5 s")
+        raise RuntimeError("camera gave no frame within 10 s")
 
-    def run(self):
-        cap = None
+    def read_frames(self, proc):
+        error = None
         try:
-            import cv2
-            cap = cv2.VideoCapture(
-                self.PIPELINE.format(flip=CAMERA_FLIP, w=CAMERA_WIDTH, h=CAMERA_HEIGHT),
-                cv2.CAP_GSTREAMER,
-            )
-            if not cap.isOpened():
-                raise RuntimeError(
-                    "could not open the camera; close any notebook using it, or run "
-                    "`sudo systemctl restart nvargus-daemon`"
-                )
-            while time.time() - self.last_request < CAMERA_IDLE_SECONDS:
-                ok, frame = cap.read()
-                if not ok:
-                    raise RuntimeError("camera stopped delivering frames")
+            while True:
+                header = proc.stdout.read(4)
+                if len(header) < 4:
+                    break
+                size = struct.unpack(">I", header)[0]
+                data = proc.stdout.read(size)
+                if len(data) < size:
+                    break  # the helper died mid-frame
                 with self.lock:
-                    self.frame = frame
-        except Exception as exc:
-            print("camera: {}".format(exc), flush=True)
-            with self.lock:
-                self.error = str(exc)
+                    self.frame = data
+                    if time.time() - self.last_request > CAMERA_IDLE_SECONDS:
+                        return  # nobody is watching any more
         finally:
-            # Always give the camera back, or every later open fails.
-            if cap is not None:
-                cap.release()
+            proc.stdout.close()  # tells the helper to release the camera and exit
+            try:
+                code = proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                code = proc.wait()
+            if code == 3:
+                error = ("could not open the camera; close any notebook using it, or run "
+                         "`sudo systemctl restart nvargus-daemon`")
+            elif code not in (0, None):
+                error = "camera helper stopped (exit code {})".format(code)
             with self.lock:
-                self.frame = None
-                self.started = False  # the next request opens it again
+                if self.proc is proc:
+                    self.proc = None
+                    self.frame = None
+                    if error and not self.idle_stop():
+                        self.error = error
+                        print("camera: {}".format(error), flush=True)
+
+    def idle_stop(self):
+        return time.time() - self.last_request > CAMERA_IDLE_SECONDS
 
 
 camera = Camera()
@@ -176,11 +214,35 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def stream_camera(self):
+        """Send frames one after another until the viewer disconnects."""
+        try:
+            data = camera.jpeg()  # fails before any headers go out if the camera is broken
+        except Exception as exc:
+            return self.reply(503, {"error": "{}: {}".format(type(exc).__name__, exc)})
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            while True:
+                self.wfile.write(
+                    b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n"
+                )
+                self.wfile.flush()
+                time.sleep(1.0 / CAMERA_STREAM_FPS)
+                data = camera.jpeg()
+        except (OSError, RuntimeError):
+            pass  # viewer left, or the camera stopped
+
     def do_GET(self):
-        if self.path not in ("/battery", "/camera.jpg"):
+        if self.path not in ("/battery", "/camera.jpg", "/camera.mjpg"):
             return self.reply(404, {"error": "not found"})
         if not self.authorized():
             return
+        if self.path == "/camera.mjpg":
+            return self.stream_camera()
         try:
             if self.path == "/battery":
                 return self.reply(200, read_battery())
@@ -194,10 +256,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
-        if self.path != "/drive":
+        if self.path not in ("/drive", "/trim"):
             return self.reply(404, {"error": "not found"})
         if not self.authorized():
             return
+        if self.path == "/trim":
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
+                set_trim(float(body["offset"]))
+            except (ValueError, KeyError, TypeError) as exc:
+                return self.reply(400, {"error": 'send {"offset": a small number such as -0.1}: ' + str(exc)})
+            return self.reply(200, {"steering_offset": car.steering_offset})
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
             throttle = max(-1.0, min(1.0, float(body["throttle"])))
@@ -225,6 +294,7 @@ class Server(ThreadingMixIn, HTTPServer):
 
 if __name__ == "__main__":
     set_drive(0.0, 0.0)
+    refresh_steering()  # put the wheels at "straight" now, with the offset applied
     threading.Thread(target=watchdog, daemon=True).start()
     try:
         print("battery: {voltage} V ({percent}%)".format(**read_battery()), flush=True)

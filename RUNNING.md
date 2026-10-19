@@ -1,7 +1,7 @@
 # Running LastMile
 
 How to start the dashboard, the Gemini orchestrator and the Jetson car.
-The Mac is at `192.168.137.28` and the car is at `192.168.137.244`.
+The Mac is at `192.168.137.28` and the car is at `192.168.137.106`.
 If the network changes, check the Mac's IP with `ipconfig getifaddr en0` and use the new one everywhere.
 
 ## 1. Mac: dashboard
@@ -33,7 +33,7 @@ uvicorn app:app --host 0.0.0.0 --port 8012
 Run from the project folder on the Mac. Repeat whenever `robot/` or `join.py` changes.
 
 ```bash
-scp -r robot join.py jetson@192.168.137.244:LastMile/
+scp -r robot join.py jetson@192.168.137.106:LastMile/
 ```
 
 ## 4. Jetson: motor bridge
@@ -41,7 +41,7 @@ scp -r robot join.py jetson@192.168.137.244:LastMile/
 Runs on the car itself and gives the robot access to the motors, camera and battery.
 
 ```bash
-ssh jetson@192.168.137.244
+ssh jetson@192.168.137.106
 sudo systemctl restart nvargus-daemon
 cd ~/LastMile/robot
 pkill -f motor_bridge.py
@@ -55,7 +55,7 @@ The log should end with `motor bridge listening on port 8090`. Then type `exit`.
 ## 5. Mac: connect the car to the dashboard
 
 ```bash
-ssh jetson@192.168.137.244 'cd ~/LastMile && python3 join.py --stop && ROBOT_AUTH_TOKEN=lastmile-local-secret MOTOR_POWER=0.5 DRIVE_SPEED=0.6 python3 join.py --registry 192.168.137.28:3000 --host-ip 192.168.137.244 --count 1 --motor-driver jetracer'
+ssh jetson@192.168.137.106 'cd ~/LastMile && python3 join.py --stop && ROBOT_AUTH_TOKEN=lastmile-local-secret MOTOR_POWER=0.5 DRIVE_SPEED=0.6 python3 join.py --registry 192.168.137.28:3000 --host-ip 192.168.137.106 --count 1 --motor-driver jetracer'
 ```
 
 The car appears on the dashboard within about 10 seconds. Robots get names in the order
@@ -79,7 +79,7 @@ In the task console, use the car's name from the dashboard:
 
 ```bash
 python3 join.py --stop
-ssh jetson@192.168.137.244 'cd ~/LastMile && python3 join.py --stop; pkill -f motor_bridge.py'
+ssh jetson@192.168.137.106 'cd ~/LastMile && python3 join.py --stop; pkill -f motor_bridge.py'
 ```
 
 Then press Ctrl+C in the dashboard and orchestrator terminals.

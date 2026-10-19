@@ -1,7 +1,9 @@
 const ORCHESTRATOR_URL = (process.env.ORCHESTRATOR_URL || "http://localhost:8012").replace(/\/$/, "");
 
-// Passes other orchestrator calls (camera frames, autopilot) through unchanged,
-// including binary JPEG bodies.
+export const dynamic = "force-dynamic";
+
+// Passes other orchestrator calls (camera video, autopilot) through unchanged.
+// The body is streamed, not buffered, so live video arrives frame by frame.
 async function forward(req, { params }) {
   try {
     const response = await fetch(`${ORCHESTRATOR_URL}/${params.path.map(encodeURIComponent).join("/")}`, {
@@ -10,7 +12,7 @@ async function forward(req, { params }) {
       body: req.method === "GET" ? undefined : await req.text(),
       cache: "no-store",
     });
-    return new Response(await response.arrayBuffer(), {
+    return new Response(response.body, {
       status: response.status,
       headers: {
         "Content-Type": response.headers.get("content-type") || "application/json",

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 try:
@@ -166,6 +167,19 @@ def resolve_destination(destination: str):
         key = room.group(1)
         door_id = ROOM_DOORS.get(key) or next(
             (d["id"] for d in (FLOOR4 or {}).get("doors", []) if d["id"].lower() == key and d.get("branch")),
+            None,
+        )
+        if door_id:
+            return {"name": f"room {door_id.split('-')[0]}", **KNOWN_LOCATIONS["ecs"],
+                    "space": "floor4", "door_id": door_id}
+    # "room 405 door 1", "405 door a", "405-a": a door written with a number or letter.
+    room_door = re.fullmatch(r"(?:ecs[\s-]*)?(?:room\s*)?(\d+[a-z]?)[\s-]*(?:door|entry|entrance)?[\s-]*([a-z]|\d)", normalized)
+    if room_door:
+        number, entry = room_door.groups()
+        swapped = {"a": "1", "b": "2", "c": "3", "1": "a", "2": "b", "3": "c"}.get(entry)
+        door_id = next(
+            (d["id"] for d in (FLOOR4 or {}).get("doors", [])
+             if d.get("branch") and d["id"].lower() in (f"{number}-{entry}", f"{number}-{swapped}")),
             None,
         )
         if door_id:
@@ -772,7 +786,7 @@ async def chat(req: ChatRequest):
         "(cpace = College of Professional and Continuing Education, vec = Vivian Engineering Center). "
         "Any of them can be a pickup or a destination. Rooms on the ECS "
         "4th floor (for example 407) are delivery destinations: pass the room number as "
-        "destination, and pass where the package comes from (for example cpace) as "
+        "destination (a specific door as 405-1; door A of a room is its first door), and pass where the package comes from (for example cpace) as "
         "pickup. If a robot dies mid-delivery the system hands the package to the robot "
         "closest to where it died. The map uses "
         "x and y from 0 to 100; interpret top "
@@ -886,6 +900,40 @@ async def camera_frame(robot_id: str) -> bytes:
 @app.get("/robots/{robot_id}/camera")
 async def robot_camera(robot_id: str):
     return Response(await camera_frame(robot_id), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/robots/{robot_id}/camera.mjpg")
+async def robot_camera_stream(robot_id: str):
+    """Live camera video, relayed from the robot without buffering."""
+    robot = await find_robot(robot_id)
+    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=10.0))
+    try:
+        response = await client.send(
+            client.build_request("GET", f"{robot_url(robot)}/camera.mjpg", headers=robot_headers()),
+            stream=True,
+        )
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"{robot_id} camera unreachable: {exc}")
+    if response.status_code != 200:
+        body = (await response.aread()).decode(errors="replace")
+        await response.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=response.status_code, detail=body)
+
+    async def chunks():
+        try:
+            async for chunk in response.aiter_raw():
+                yield chunk
+        except httpx.HTTPError:
+            pass
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        chunks(), media_type=response.headers["content-type"], headers={"Cache-Control": "no-store"}
+    )
 
 
 def autopilot_tools():

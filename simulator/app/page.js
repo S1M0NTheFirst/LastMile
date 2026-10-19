@@ -1871,7 +1871,7 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
 
 // Live camera and Gemini autopilot for a real car (robots whose state has camera: true).
 function RobotCamera({ name, onLog }) {
-  const [frame, setFrame] = useState(0);
+  const [attempt, setAttempt] = useState(0);
   const [camError, setCamError] = useState("");
   const [mission, setMission] = useState(null);
   const [goal, setGoal] = useState("");
@@ -1882,11 +1882,6 @@ function RobotCamera({ name, onLog }) {
     alive.current = true;
     return () => { alive.current = false; };
   }, []);
-
-  // Ask for the next frame only once the last one arrived, so slow links don't pile up requests.
-  function nextFrame(delay) {
-    setTimeout(() => alive.current && setFrame((f) => f + 1), delay);
-  }
 
   useEffect(() => {
     async function poll() {
@@ -1933,10 +1928,13 @@ function RobotCamera({ name, onLog }) {
       <div className="label" style={{ marginTop: 12 }}>CAMERA</div>
       <div className="camera">
         <img
-          src={`/api/orchestrator/robots/${name}/camera?f=${frame}`}
+          src={`/api/orchestrator/robots/${name}/camera.mjpg?a=${attempt}`}
           alt={`${name} camera`}
-          onLoad={() => { setCamError(""); nextFrame(200); }}
-          onError={() => { setCamError("camera unavailable, retrying…"); nextFrame(2000); }}
+          onLoad={() => setCamError("")}
+          onError={() => {
+            setCamError("camera unavailable, retrying…");
+            setTimeout(() => alive.current && setAttempt((a) => a + 1), 2000);
+          }}
         />
         {camError && <div className="camera-error">{camError}</div>}
       </div>

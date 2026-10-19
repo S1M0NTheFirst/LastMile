@@ -75,6 +75,14 @@ class Navigator:
         self.pose.update(u=ELEVATOR["u"], v=ELEVATOR["v"], heading=math.pi / 2, space="floor4")
         self.mission = {"phase": "at_elevator", "door_id": None}
 
+    def place_at_door(self, door_id):
+        """Put the robot where it sits after touching a door (used to start a real car at a door)."""
+        target = door_target(door_id)
+        self.queue = []
+        self.command = (0.0, 0.0)
+        self.pose.update(u=target["u"], v=target["v"], heading=target["heading"], space="floor4")
+        self.mission = {"phase": "door_touched", "door_id": door_id}
+
     def _travel(self, at, to):
         """Queue centerline legs between two hallway points, via the junction when
         one end is in the main hallway and the other in the cross hallway."""

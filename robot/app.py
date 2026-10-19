@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from navigation import DOORS, FLOOR, Navigator
 
@@ -48,7 +49,10 @@ METERS_PER_UNIT = 2.0  # the dashboard's 0-100 grid spans 200 m
 FLOOR4_BUILDING = {"x": 50.0, "y": 50.0}
 # Simulated robots start outside on the campus; a real car starts on the 4th
 # floor at the elevator, since that is the only map it can drive.
-START_SPACE = os.getenv("START_SPACE", "campus" if motors.DRIVER == "sim" else "floor4")
+# START_X/START_Y put a simulated robot at a chosen campus spot (default: random);
+# START_DOOR (e.g. 411-1) starts a robot on the 4th floor at that door instead of the elevator.
+START_DOOR = os.getenv("START_DOOR", "")
+START_SPACE = os.getenv("START_SPACE", "campus" if motors.DRIVER == "sim" and not START_DOOR else "floor4")
 CAMPUS_LEG_SECONDS = float(os.getenv("CAMPUS_LEG_SECONDS", "4"))  # visual-only campus travel
 
 app = FastAPI(title="Robot")
@@ -82,8 +86,8 @@ state = {
     "battery": 100.0,       # 0-100
     "battery_voltage": None,  # volts, real cars only
     "camera": motors.DRIVER != "sim",  # real cars stream /camera
-    "position": {"x": round(random.uniform(0, 100), 1),
-                 "y": round(random.uniform(0, 100), 1)},
+    "position": {"x": round(float(os.getenv("START_X") or random.uniform(0, 100)), 1),
+                 "y": round(float(os.getenv("START_Y") or random.uniform(0, 100)), 1)},
     "heading": 90.0,        # degrees, counter-clockwise from east; 90 = facing north (+y)
     "inbox": [],            # messages received from peers
     "space": START_SPACE,   # campus (0-100 grid, visual only) | floor4 (measured meters)
@@ -338,6 +342,19 @@ async def camera(authorization: str | None = Header(default=None)):
     return Response(frame.content, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
+@app.get("/camera.mjpg")
+async def camera_stream(authorization: str | None = Header(default=None)):
+    """Live camera video (real cars only), relayed from the bridge."""
+    require_robot_token(authorization)
+    if not state["camera"]:
+        raise HTTPException(status_code=404, detail=f"{state['id']} has no camera")
+    try:
+        content_type, chunks = await motors.bridge_stream("/camera.mjpg")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return StreamingResponse(chunks, media_type=content_type, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/heartbeat")
 def heartbeat():
     if not responsive():
@@ -450,7 +467,12 @@ def step_rate(step: dict) -> float:
 
 navigator = make_navigator()
 if START_SPACE == "floor4":
-    navigator.place_at_elevator()
+    if START_DOOR:
+        if START_DOOR not in DOORS or not DOORS[START_DOOR]["branch"]:
+            raise RuntimeError(f"START_DOOR {START_DOOR!r} is not a placed door; use an id such as 411-1")
+        navigator.place_at_door(START_DOOR)
+    else:
+        navigator.place_at_elevator()
     state["position"] = dict(FLOOR4_BUILDING)
 else:
     navigator.pose["space"] = "campus"
