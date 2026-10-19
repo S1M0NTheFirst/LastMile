@@ -43,6 +43,8 @@ INA219_ADDR = int(os.getenv("INA219_ADDR", "0x41"), 16)
 BATTERY_FULL_V = float(os.getenv("BATTERY_FULL_V", "12.6"))
 BATTERY_EMPTY_V = float(os.getenv("BATTERY_EMPTY_V", "9.0"))
 CAMERA_WIDTH, CAMERA_HEIGHT = 640, 360
+CAMERA_JPEG_QUALITY = int(os.getenv("CAMERA_JPEG_QUALITY", "65"))
+CAMERA_IDLE_SECONDS = 10  # release the camera this long after the last request
 CAMERA_FLIP = 2 if os.getenv("FLIP_CAMERA") else 0  # nvvidconv flip-method 2 = rotate 180
 
 car = NvidiaRacecar()
@@ -93,7 +95,9 @@ def read_battery():
 class Camera:
     """Keeps reading the CSI camera in the background so a frame is always fresh.
 
-    Opened on the first request, so the bridge also runs without a camera.
+    Opened on the first request and released CAMERA_IDLE_SECONDS after the last
+    one, so the Nano's CPU (and the camera for other programs) is free whenever
+    nobody is watching.
     """
     PIPELINE = (
         "nvarguscamerasrc ! video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! "
@@ -106,9 +110,11 @@ class Camera:
         self.frame = None
         self.error = None
         self.started = False
+        self.last_request = 0.0
 
     def jpeg(self):
         with self.lock:
+            self.last_request = time.time()
             if not self.started:
                 self.started = True
                 self.error = None
@@ -121,7 +127,7 @@ class Camera:
                 raise RuntimeError(error)
             if frame is not None:
                 import cv2
-                ok, data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                ok, data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, CAMERA_JPEG_QUALITY])
                 if not ok:
                     raise RuntimeError("could not encode the camera frame")
                 return data.tobytes()
@@ -129,6 +135,7 @@ class Camera:
         raise RuntimeError("camera gave no frame within 5 s")
 
     def run(self):
+        cap = None
         try:
             import cv2
             cap = cv2.VideoCapture(
@@ -140,7 +147,7 @@ class Camera:
                     "could not open the camera; close any notebook using it, or run "
                     "`sudo systemctl restart nvargus-daemon`"
                 )
-            while True:
+            while time.time() - self.last_request < CAMERA_IDLE_SECONDS:
                 ok, frame = cap.read()
                 if not ok:
                     raise RuntimeError("camera stopped delivering frames")
@@ -150,8 +157,13 @@ class Camera:
             print("camera: {}".format(exc), flush=True)
             with self.lock:
                 self.error = str(exc)
+        finally:
+            # Always give the camera back, or every later open fails.
+            if cap is not None:
+                cap.release()
+            with self.lock:
                 self.frame = None
-                self.started = False  # the next request tries again
+                self.started = False  # the next request opens it again
 
 
 camera = Camera()
