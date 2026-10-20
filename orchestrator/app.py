@@ -11,6 +11,7 @@ import json
 import os
 import math
 import re
+import socket
 import time
 import uuid
 from datetime import datetime, timezone
@@ -36,6 +37,7 @@ LOCAL_HOST_IP = os.getenv("LOCAL_HOST_IP", "")
 LOCAL_ROBOT_HOST = os.getenv("LOCAL_ROBOT_HOST", "127.0.0.1")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "30"))
 TASK_TIMEOUT_SECONDS = float(os.getenv("TASK_TIMEOUT_SECONDS", "15"))
 MAX_TASK_RETRIES = int(os.getenv("MAX_TASK_RETRIES", "1"))
 AUTOPILOT_MAX_STEPS = int(os.getenv("AUTOPILOT_MAX_STEPS", "20"))
@@ -130,30 +132,59 @@ def robot_headers():
     return {"Authorization": f"Bearer {ROBOT_AUTH_TOKEN}"} if ROBOT_AUTH_TOKEN else {}
 
 
+_local_hosts: dict[str, bool] = {}
+
+
+def is_this_machine(host: str) -> bool:
+    """True when host is one of this machine's own addresses, whatever network it is on now.
+
+    Robots started here register with the Mac's LAN IP, which changes with the Wi-Fi and can
+    be unreachable from the Mac itself; those are reached on LOCAL_ROBOT_HOST instead.
+    """
+    if host not in _local_hosts:
+        local = bool(LOCAL_HOST_IP) and host == LOCAL_HOST_IP
+        if not local:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                    probe.connect((host, 9))  # no traffic: only picks the source address
+                    local = probe.getsockname()[0] == host
+            except OSError:
+                pass
+        _local_hosts[host] = local
+    return _local_hosts[host]
+
+
 def robot_url(robot):
-    host = LOCAL_ROBOT_HOST if LOCAL_HOST_IP and robot.get("host") == LOCAL_HOST_IP else robot["host"]
+    host = LOCAL_ROBOT_HOST if is_this_machine(robot["host"]) else robot["host"]
     return f"http://{host}:{robot['port']}"
 
 
+ROBOT_STATE_TIMEOUT = float(os.getenv("ROBOT_STATE_TIMEOUT", "1.5"))
+
+
 async def fleet_snapshot():
+    """Every registered robot with its state, asked in parallel so one unreachable
+    robot costs one short timeout instead of delaying everything."""
     async with httpx.AsyncClient(timeout=3) as client:
         response = await client.get(REGISTRY_URL)
         response.raise_for_status()
         robots = response.json().get("robots", [])
-        result = []
-        for robot in robots:
+
+        async def look(robot):
             try:
                 state_response = await client.get(
                     f"{robot_url(robot)}/state",
                     headers=robot_headers(),
+                    timeout=ROBOT_STATE_TIMEOUT,
                 )
                 robot_state = state_response.json()
                 last_seen[robot["name"]] = {"state": robot_state, "at": now()}
-                result.append({**robot, "state": robot_state, "reachable": True})
+                return {**robot, "state": robot_state, "reachable": True}
             except (httpx.HTTPError, ValueError):
-                result.append({**robot, "state": None, "reachable": False,
-                               "last_seen": last_seen.get(robot["name"])})
-        return result
+                return {**robot, "state": None, "reachable": False,
+                        "last_seen": last_seen.get(robot["name"])}
+
+        return list(await asyncio.gather(*(look(robot) for robot in robots)))
 
 
 def resolve_destination(destination: str):
@@ -244,6 +275,16 @@ def describe_floor4_spot(u: float, v: float) -> str:
     return f"{abs(v):.1f} m down the {side} hallway"
 
 
+def stuck_on_floor4(robot_state: dict, task_type: str, target: dict) -> bool:
+    """A real car can't leave the 4th floor, so it never takes a package from outside."""
+    return (
+        task_type == "deliver_package"
+        and robot_state.get("driver", "sim") != "sim"
+        and robot_state.get("space") == "floor4"
+        and target.get("space") != "floor4"
+    )
+
+
 async def assign_task(
     task_type: str,
     payload: dict,
@@ -277,6 +318,7 @@ async def assign_task(
         and float(robot["state"].get("battery", 0)) >= minimum_battery
         and robot["name"] not in excluded_robot_ids
         and robot["name"] not in busy_robot_ids
+        and not stuck_on_floor4(robot["state"], task_type, target)
     ]
     requested_robot = (
         next((robot for robot in robots if robot["name"] == robot_id), None)
@@ -776,7 +818,8 @@ async def chat(req: ChatRequest):
         "say which robot to drive, ask instead of picking one. Use start_autopilot "
         "when the user wants a robot to react to what its camera sees (find, look for, "
         "until you see, follow, avoid); only robots whose state has camera true can do "
-        "that. Never "
+        "that. Only pass robot_id when the user names that robot; otherwise leave it "
+        "out so the nearest robot is chosen. Never "
         "invent robot IDs and never issue HTTP or shell "
         "commands. If the requested robot is unavailable, hand the task to another "
         "available robot and explain the handoff. If the request is unrelated, "
@@ -795,17 +838,25 @@ async def chat(req: ChatRequest):
         f"Fleet snapshot:\n{fleet_context}\n\nUser request: {req.message}"
     )
     client = genai.Client(api_key=GEMINI_API_KEY)
+    started = time.time()
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(tools=gemini_tools()),
+        # Async, so a slow Gemini answer doesn't freeze fleet polling and task watching.
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(tools=gemini_tools()),
+            ),
+            timeout=GEMINI_TIMEOUT_SECONDS,
         )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"Gemini did not answer within {GEMINI_TIMEOUT_SECONDS:g} s; try again")
     except Exception as exc:
         raise HTTPException(
             status_code=502,
             detail=f"Gemini request failed ({type(exc).__name__}): {exc}",
         )
+    print(f"chat: Gemini answered in {time.time() - started:.1f} s", flush=True)
     calls = getattr(response, "function_calls", None) or []
     if not calls:
         return {"message": response.text, "executed": None}
@@ -814,6 +865,9 @@ async def chat(req: ChatRequest):
     if call.name not in ("assign_move_task", "assign_delivery_task", "drive_robot", "start_autopilot"):
         raise HTTPException(status_code=400, detail=f"unsupported Gemini tool: {call.name}")
     args = dict(call.args or {})
+    # Gemini may name a robot nobody asked for; "pick a robot" means the nearest one.
+    if call.name in ("assign_move_task", "assign_delivery_task") and str(args.get("robot_id", "")).lower() not in req.message.lower():
+        args.pop("robot_id", None)
     if call.name == "start_autopilot":
         mission = await start_autopilot(
             AutopilotRequest(robot_id=str(args.get("robot_id", "")), goal=str(args.get("goal", "")))

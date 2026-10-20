@@ -1229,6 +1229,172 @@ function toScene(pos) {
   return { x: (p.x / 100 - 0.5) * ROBOT_SPAN, z: (0.5 - p.y / 100) * ROBOT_SPAN };
 }
 
+// ---- Campus roads ----
+// A simulated robot crosses the campus along the OpenStreetMap roads rather than in a straight
+// line: paths become a graph (ways that share a point are joined) and a trip follows the cheapest
+// route over it, preferring roads to footpaths. The robot itself still reports a straight line
+// plus its progress along it (state.leg); that progress is mapped onto the road route here.
+const ROAD_COST = { road: 1, service: 1, cycleway: 1.4, footway: 2.2, steps: 6 };
+let roadGraph = null;
+const routeCache = new Map();
+
+function buildRoadGraph(paths) {
+  const nodes = [];
+  const edges = [];
+  const segments = [];
+  const index = new Map();
+  const nodeAt = ([x, z]) => {
+    const key = `${Math.round(x * 2)},${Math.round(z * 2)}`; // half-meter grid joins shared points
+    let i = index.get(key);
+    if (i === undefined) {
+      i = nodes.length;
+      index.set(key, i);
+      nodes.push([x, z]);
+      edges.push([]);
+    }
+    return i;
+  };
+  for (const p of paths) {
+    const weight = ROAD_COST[p.kind] ?? 2.2;
+    for (let i = 1; i < p.points.length; i++) {
+      const a = nodeAt(p.points[i - 1]), b = nodeAt(p.points[i]);
+      if (a === b) continue;
+      const len = Math.hypot(nodes[a][0] - nodes[b][0], nodes[a][1] - nodes[b][1]);
+      edges[a].push({ to: b, cost: len * weight });
+      edges[b].push({ to: a, cost: len * weight });
+      segments.push({ a, b, len, weight });
+    }
+  }
+  return { nodes, edges, segments };
+}
+
+// Joins a point to the nearest spot on a road (not just the nearest road corner, which can be a
+// dead end behind it). Adds a temporary node on that segment; `detach` removes it again.
+function attachToRoad(graph, [x, z]) {
+  let best = null;
+  for (const seg of graph.segments) {
+    const [ax, az] = graph.nodes[seg.a], [bx, bz] = graph.nodes[seg.b];
+    const dx = bx - ax, dz = bz - az;
+    const f = THREE.MathUtils.clamp(((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz), 0, 1);
+    const px = ax + dx * f, pz = az + dz * f;
+    const d = Math.hypot(x - px, z - pz);
+    if (!best || d < best.distance) best = { seg, f, px, pz, distance: d };
+  }
+  if (!best || best.distance > 80) return null;
+  const { seg, f } = best;
+  const index = graph.nodes.length;
+  graph.nodes.push([best.px, best.pz]);
+  graph.edges.push([]);
+  for (const [end, share] of [[seg.a, f], [seg.b, 1 - f]]) {
+    const cost = share * seg.len * seg.weight;
+    graph.edges[index].push({ to: end, cost });
+    graph.edges[end].push({ to: index, cost });
+  }
+  return {
+    index,
+    seg,
+    detach() {
+      graph.edges[seg.a].pop();
+      graph.edges[seg.b].pop();
+      graph.edges.pop();
+      graph.nodes.pop();
+    },
+  };
+}
+
+// Cheapest route between two scene points over the road graph, as [[x, z], ...] with the exact
+// start and end points; null when there is no usable route (the caller then goes straight).
+function roadPath(graph, from, to) {
+  const s = attachToRoad(graph, from);
+  if (!s) return null;
+  const t = attachToRoad(graph, to);
+  try {
+    return t && s.seg !== t.seg ? shortestRoute(graph, s.index, t.index, from, to) : null;
+  } finally {
+    t?.detach();
+    s.detach();
+  }
+}
+
+function shortestRoute(graph, start, goal, from, to) {
+  const cost = new Map([[start, 0]]);
+  const previous = new Map();
+  const queue = [[0, start]]; // binary min-heap of [cost, node]
+  const push = (item) => {
+    queue.push(item);
+    for (let i = queue.length - 1; i > 0;) {
+      const parent = (i - 1) >> 1;
+      if (queue[parent][0] <= queue[i][0]) break;
+      [queue[parent], queue[i]] = [queue[i], queue[parent]];
+      i = parent;
+    }
+  };
+  const pop = () => {
+    const top = queue[0], last = queue.pop();
+    if (queue.length) {
+      queue[0] = last;
+      for (let i = 0; ;) {
+        const l = 2 * i + 1, r = l + 1;
+        let m = i;
+        if (l < queue.length && queue[l][0] < queue[m][0]) m = l;
+        if (r < queue.length && queue[r][0] < queue[m][0]) m = r;
+        if (m === i) break;
+        [queue[m], queue[i]] = [queue[i], queue[m]];
+        i = m;
+      }
+    }
+    return top;
+  };
+  while (queue.length) {
+    const [c, node] = pop();
+    if (node === goal) break;
+    if (c > (cost.get(node) ?? Infinity)) continue;
+    for (const e of graph.edges[node]) {
+      const next = c + e.cost;
+      if (next < (cost.get(e.to) ?? Infinity)) {
+        cost.set(e.to, next);
+        previous.set(e.to, node);
+        push([next, e.to]);
+      }
+    }
+  }
+  if (!cost.has(goal)) return null;
+  const inner = [];
+  for (let n = goal; n !== undefined; n = previous.get(n)) inner.push(graph.nodes[n]);
+  return [from, ...inner.reverse(), to];
+}
+
+function withLengths(points) {
+  const cum = [0];
+  for (let i = 1; i < points.length; i++) cum.push(cum[i - 1] + Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]));
+  return { points, cum, length: cum[cum.length - 1] };
+}
+
+// The point `fraction` (0-1) of the way along a route.
+function pointAlong(route, fraction) {
+  const d = THREE.MathUtils.clamp(fraction, 0, 1) * route.length;
+  let i = 1;
+  while (i < route.cum.length - 1 && route.cum[i] < d) i++;
+  const a = route.points[i - 1], b = route.points[i];
+  const span = route.cum[i] - route.cum[i - 1];
+  const f = span > 1e-9 ? (d - route.cum[i - 1]) / span : 1;
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+}
+
+// The road route for a robot's campus trip (state.leg), cached; falls back to a straight line.
+function legRoute(leg) {
+  const key = `${leg.from.x},${leg.from.y}>${leg.to.x},${leg.to.y}`;
+  let route = routeCache.get(key);
+  if (!route) {
+    const a = toScene(leg.from), b = toScene(leg.to);
+    const from = [a.x, a.z], to = [b.x, b.z];
+    route = withLengths((roadGraph && roadPath(roadGraph, from, to)) || [from, to]);
+    routeCache.set(key, { ...route, key });
+    route = routeCache.get(key);
+  }
+  return route;
+}
+
 const HOME = new THREE.Vector3(0, 125, 140); // overview camera: whole 100 m radius in frame
 const BASE_FOV = 55;
 // Zoom limits per camera mode. Overview zooms by camera distance, Follow by how far
@@ -1382,6 +1548,8 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         if (disposed) return;
         scene.remove(placeholder);
         disposeScene(placeholder);
+        roadGraph = buildRoadGraph(layout.paths);
+        routeCache.clear();
         const campus = new THREE.Group();
         const info = buildCampusWorld(campus, layout);
         scene.add(campus);
@@ -1421,6 +1589,19 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
           : robotToHallway(r.state?.position);
         const [x, z] = planToLocal(u, v);
         return { x, z, u, v };
+      }
+      const pose = r.state?.pose;
+      if (pose?.space === "floor4" && floor.fit) {
+        // A robot on the 4th floor is shown there (inside ECS, at floor height) even from the overview.
+        const [x, z] = planToWorld(pose.u, pose.v, floor.fit.phi, floor.fit.tx, floor.fit.tz);
+        return { x, z, y: FLOOR4.elevation };
+      }
+      const leg = r.state?.leg;
+      if (leg) {
+        // On a trip: follow the roads, in step with how far along the straight line the robot is.
+        const route = legRoute(leg);
+        const [x, z] = pointAlong(route, leg.progress);
+        return { x, z, leg: { key: route.key, route, progress: leg.progress } };
       }
       return toScene(r.state?.position);
     }
@@ -1473,17 +1654,32 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         }
         m.hex = robotHex(r);
         m.authoritative = robotSpace === "hallway" && r.state?.pose?.space === "floor4";
+        const level = target.y ?? 0; // 4th-floor height for a floor robot seen from the campus overview
+        if (m.level !== undefined && m.level !== level) m.reset = true; // went up or down the elevator
+        m.level = level;
         if (m.authoritative || robotSpace === "campus") {
           m.target = target;
           m.route = [];
           if (m.reset) {
-            m.group.position.set(target.x, 0, target.z);
+            m.group.position.set(target.x, level, target.z);
             m.samples = [];
             m.trail = [];
+            m.leg = null;
           }
           m.reset = false;
           if (fresh || !m.samples.length) {
-            addSample(m, { t: sampleTime, x: target.x, z: target.z, h: m.authoritative ? r.state.pose.heading : undefined });
+            const last = m.samples[m.samples.length - 1];
+            if (target.leg && m.leg?.key === target.leg.key && last && target.leg.progress > m.leg.progress) {
+              // Corners on the way since the last poll, so the robot follows the road bends.
+              const n = Math.min(24, Math.ceil((target.leg.progress - m.leg.progress) * target.leg.route.length / 2));
+              for (let k = 1; k < n; k++) {
+                const f = k / n;
+                const [x, z] = pointAlong(target.leg.route, m.leg.progress + (target.leg.progress - m.leg.progress) * f);
+                addSample(m, { t: last.t + (sampleTime - last.t) * f, x, z, y: level });
+              }
+            }
+            m.leg = target.leg ?? null;
+            addSample(m, { t: sampleTime, x: target.x, z: target.z, y: level, h: m.authoritative ? r.state.pose.heading : undefined });
           }
           const previous = m.trail[m.trail.length - 1];
           if (!previous || Math.hypot(previous[0] - target.x, previous[1] - target.z) > 0.03) {
@@ -1540,6 +1736,7 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         }
         pos.x = x;
         pos.z = z;
+        pos.y = (a.y ?? 0) + ((b.y ?? 0) - (a.y ?? 0)) * f;
         return;
       }
       if (!m.route?.length) return;
@@ -1578,7 +1775,7 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         m.line = null;
       }
       if (!trails || m.line || m.trail.length < 2) return;
-      const pts = m.trail.map((p) => new THREE.Vector3(p[0], 0.08, p[1]));
+      const pts = m.trail.map((p) => new THREE.Vector3(p[0], (m.level ?? 0) + 0.08, p[1]));
       const sel = selected === name;
       m.line = new THREE.Line(
         new THREE.BufferGeometry().setFromPoints(pts),
@@ -1710,7 +1907,7 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         m.body.material.color.setHex(m.hex);
         m.body.material.emissive.setHex(m.hex);
         m.ring.material.color.setHex(m.hex);
-        m.nameLabel.position.copy(m.group.position).y = 1.2 * s;
+        m.nameLabel.position.copy(m.group.position).y += 1.2 * s;
         const labelHeight = 2 * Math.tan(THREE.MathUtils.degToRad(cam.fov / 2)) * (selected === name ? 17 : 14) / view.clientHeight;
         m.nameLabel.scale.set(labelHeight * m.nameLabel.userData.aspect, labelHeight, 1);
         m.nameLabel.material.color.setHex(selected === name ? 0xffc06b : 0xffffff);

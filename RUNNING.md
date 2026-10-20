@@ -75,6 +75,41 @@ In the task console, use the car's name from the dashboard:
 - `robot0 forward 1 m, turn left`
 - `robot0 drive until you see a door and stop`
 
+## Demo: a robot fails and the car takes over
+
+Five simulated robots spread over the campus, and the car at room 411 (door 411-1) on the 4th floor.
+Send a package from a far building to room 405, then fail the robot that took it while it is in the 4th-floor
+hallway. The orchestrator hands the package to the closest robot to where it stopped, which is the car.
+
+1. Copy the code to the car again (`robot/` and `join.py` changed): step 3. No bridge restart is needed.
+2. Put the car by the door of room 411, facing the door, then start it there (step 5, with `START_DOOR`):
+
+```bash
+ssh jetson@192.168.137.106 'cd ~/LastMile && python3 join.py --stop && START_DOOR=411-1 ROBOT_AUTH_TOKEN=lastmile-local-secret MOTOR_POWER=0.5 DRIVE_SPEED=0.6 python3 join.py --registry 192.168.137.28:3000 --host-ip 192.168.137.106 --count 1 --motor-driver jetracer'
+```
+
+3. On the Mac, start the five robots (after the car, so the car is `robot0`):
+
+```bash
+ROBOT_AUTH_TOKEN=lastmile-local-secret python3 join.py --stop; ROBOT_AUTH_TOKEN=lastmile-local-secret python3 join.py --registry 192.168.137.28:3000 --host-ip 192.168.137.28 --at "Engineering Technology; Vivian Engineering Center; College of Professional and Continuing Education; Student Recreation and Wellness Center; University Police"
+```
+
+Simulated robots cross the campus at 3 m/s along the map's roads. Set `CAMPUS_SPEED=6` (meters per second) before the command to speed them up, or lower it to slow them down.
+
+`--at` takes building names or `x,y` points (0-100), one per robot. Keep the other robots far from ECS
+(the building with the 4th floor), or one of them can be closer to the failure than the car.
+
+4. In the task console:
+
+```
+deliver package pkg1 from Engineering Technology to room 405 door 1
+```
+
+The robot nearest Engineering Technology takes it, rides to the 4th floor and drives toward 405.
+5. While it drives in the hallway, click it on the dashboard and press FAIL ROBOT (or `docker rm -f` its container).
+The task is reassigned to the car, which drives to where the robot stopped, picks the package up and delivers it to
+door 405-1. **The car really drives** this route at its calibrated speed, so clear its path and be ready to lift it.
+
 ## Stop
 
 ```bash
