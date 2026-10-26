@@ -1,8 +1,8 @@
 # LastMile orchestrator
 
-This is the first LLM-to-robot vertical slice. It exposes a Gemini-backed
-`POST /chat` endpoint and a direct `POST /tasks` endpoint. Gemini currently has
-one tool: `assign_move_task`.
+This is the LLM-to-robot gateway. It exposes Gemini-backed chat, task, and
+camera-autopilot endpoints. Gemini authentication uses Google Application
+Default Credentials (ADC), not an API key.
 
 ## Run on Machine B
 
@@ -12,8 +12,10 @@ From `LastMile/`:
 python3 -m venv orchestrator/.venv
 orchestrator/.venv/bin/pip install -r orchestrator/requirements.txt
 
+gcloud auth application-default login
+export GOOGLE_CLOUD_PROJECT="<your-google-cloud-project>"
+export GOOGLE_CLOUD_LOCATION="global"
 export REGISTRY_URL="http://<machine-b-ip>:3000/api/registry"
-export GEMINI_API_KEY="<your-key>"
 export GEMINI_MODEL="gemini-3.8-flash"
 export ROBOT_AUTH_TOKEN="a-shared-local-secret"
 

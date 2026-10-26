@@ -3,8 +3,8 @@
 Gemini plans through narrow tools (assign_move_task, drive_robot, ...). This
 service validates the request, selects a healthy robot from the registry, and
 executes the task. It also runs camera autopilots: Gemini looks at a real car's
-camera, picks one small move, and repeats until the goal is reached. The Gemini
-key never leaves this service.
+camera, picks one small move, and repeats until the goal is reached. Google
+Application Default Credentials are used for Gemini authentication.
 """
 import asyncio
 import json
@@ -34,7 +34,8 @@ ROBOT_AUTH_TOKEN = os.getenv("ROBOT_AUTH_TOKEN", "")
 LOCAL_HOST_IP = os.getenv("LOCAL_HOST_IP", "")
 LOCAL_ROBOT_HOST = os.getenv("LOCAL_ROBOT_HOST", "127.0.0.1")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 TASK_TIMEOUT_SECONDS = float(os.getenv("TASK_TIMEOUT_SECONDS", "15"))
 MAX_TASK_RETRIES = int(os.getenv("MAX_TASK_RETRIES", "1"))
 AUTOPILOT_MAX_STEPS = int(os.getenv("AUTOPILOT_MAX_STEPS", "20"))
@@ -59,6 +60,35 @@ CAMPUS_BUILDINGS = json.loads((Path(__file__).resolve().parent / "campus_buildin
 for building_name, spot in CAMPUS_BUILDINGS.items():
     KNOWN_LOCATIONS.setdefault(building_name.lower(), {"x": spot["x"], "y": spot["y"]})
 METERS_PER_UNIT = 2.0  # the dashboard's 0-100 grid spans 200 m
+
+
+def gemini_configured() -> bool:
+    return (
+        genai is not None
+        and types is not None
+        and bool(GOOGLE_CLOUD_PROJECT)
+    )
+
+
+def create_gemini_client():
+    if genai is None or types is None:
+        raise HTTPException(
+            status_code=503,
+            detail="google-genai is not installed",
+        )
+
+    if not GOOGLE_CLOUD_PROJECT:
+        raise HTTPException(
+            status_code=503,
+            detail="GOOGLE_CLOUD_PROJECT is not configured",
+        )
+
+    return genai.Client(
+        enterprise=True,
+        project=GOOGLE_CLOUD_PROJECT,
+        location=GOOGLE_CLOUD_LOCATION,
+        http_options=types.HttpOptions(api_version="v1"),
+    )
 
 
 def load_floor4():
@@ -558,7 +588,8 @@ async def start_task_watch():
 def health():
     return {
         "ok": True,
-        "gemini_configured": bool(GEMINI_API_KEY),
+        "gemini_configured": gemini_configured(),
+        "gemini_authentication": "application_default_credentials",
         "registry_url": REGISTRY_URL,
     }
 
@@ -736,11 +767,6 @@ async def cancel_task(task_id: str, req: CancelTaskRequest):
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured")
-    if genai is None:
-        raise HTTPException(status_code=503, detail="google-genai is not installed")
-
     try:
         fleet = await fleet_snapshot()
     except httpx.HTTPError as exc:
@@ -780,7 +806,7 @@ async def chat(req: ChatRequest):
         "as (90, 10), and bottom left as (10, 10).\n\n"
         f"Fleet snapshot:\n{fleet_context}\n\nUser request: {req.message}"
     )
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = create_gemini_client()
     try:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
@@ -959,7 +985,7 @@ async def wait_for_drive(task_id: str) -> dict:
 
 
 async def run_autopilot(mission: dict):
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = create_gemini_client()
     config = types.GenerateContentConfig(
         tools=autopilot_tools(),
         tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY")),
@@ -1023,8 +1049,14 @@ async def run_autopilot(mission: dict):
 
 @app.post("/autopilot")
 async def start_autopilot(req: AutopilotRequest):
-    if not GEMINI_API_KEY or genai is None:
-        raise HTTPException(status_code=503, detail="autopilot needs GEMINI_API_KEY and google-genai")
+    if not gemini_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Autopilot requires google-genai, "
+                "GOOGLE_CLOUD_PROJECT, and Application Default Credentials"
+            ),
+        )
     goal = req.goal.strip()
     if not goal:
         raise HTTPException(status_code=400, detail="autopilot needs a goal")
