@@ -131,6 +131,7 @@ def start(args):
             "--label", LABEL,
             "--label", f"lastmile.host={host_ip}",
             "--label", f"lastmile.port={port}",
+            "--label", f"lastmile.registry={args.registry}",
             "-e", f"REGISTRY={args.registry}",
             "-e", f"HOST_IP={host_ip}",
             "-e", f"HOST_PORT={port}",
@@ -142,7 +143,7 @@ def start(args):
         if args.motor_driver:
             run_args += ["-e", f"MOTOR_DRIVER={args.motor_driver}"]
         # Drive calibration (see robot/app.py), passed through when set in the shell.
-        for name in ("DRIVE_SPEED", "TURN_SPEED", "MOTOR_POWER", "MAX_MOTOR_POWER", "MAX_DRIVE_METERS", "START_SPACE", "START_DOOR", "CAMPUS_SPEED"):
+        for name in ("DRIVE_SPEED", "TURN_SPEED", "MOTOR_POWER", "MAX_MOTOR_POWER", "MAX_DRIVE_METERS", "START_SPACE", "START_DOOR", "CAMPUS_SPEED", "DRAIN_RATE"):
             if os.getenv(name):
                 run_args += ["-e", f"{name}={os.getenv(name)}"]
         run_args += [IMAGE]
@@ -153,10 +154,31 @@ def start(args):
           f"Names appear in the simulator within a few seconds.")
 
 
+def forget_in_registry(containers):
+    """Tell each registry that these robots are gone, so the dashboard drops them at once."""
+    by_registry = {}
+    for line in containers:
+        host, port, registry = line.split("|")
+        if registry:
+            by_registry.setdefault(registry, []).append({"host": host, "port": int(port)})
+    for registry, robots in by_registry.items():
+        request = urllib.request.Request(
+            f"http://{registry}/api/registry", data=json.dumps({"robots": robots}).encode(),
+            headers={"Content-Type": "application/json"}, method="DELETE")
+        try:
+            urllib.request.urlopen(request, timeout=5).read()
+        except OSError:
+            pass  # the dashboard is not running (or not reachable); it forgets them by itself
+
+
 def stop():
-    ids = docker("ps", "-aq", "--filter", f"label={LABEL}", capture=True).split()
+    info = docker("ps", "-a", "--filter", f"label={LABEL}", "--format",
+                  '{{.ID}}|{{.Label "lastmile.host"}}|{{.Label "lastmile.port"}}|{{.Label "lastmile.registry"}}',
+                  capture=True).split()
+    ids = [line.split("|")[0] for line in info]
     if ids:
         docker("rm", "-f", *ids, capture=True)
+    forget_in_registry(line.split("|", 1)[1] for line in info)
     print(f"removed {len(ids)} robot container(s) from this machine")
 
 

@@ -14,7 +14,7 @@ export async function POST(req, { params }) {
   }
   try {
     if (on) await robot.handle.start();
-    else await robot.handle.stop();
+    else await robot.handle.stop({ t: 0 }); // no 10 s grace period: a stopped robot should go down at once
   } catch (e) {
     // start on running / stop on stopped throws 304-ish; treat as no-op
     if (!String(e).includes("304")) {

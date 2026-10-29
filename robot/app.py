@@ -26,9 +26,10 @@ REGISTRY = os.getenv("REGISTRY", "")
 # Where other machines can reach this robot: the host's LAN IP + published port.
 HOST_IP = os.getenv("HOST_IP", "")
 HOST_PORT = int(os.getenv("HOST_PORT", "0"))
-# Simulated robots drain this many battery points per tick (1 tick/sec); a
+# Simulated robots drain this many battery points per tick (1 tick/sec): 0.02 empties a
+# full battery in about 83 minutes (71 minutes until the low-battery return at 15%). A
 # real car (MOTOR_DRIVER=jetracer) reports its measured battery instead.
-DRAIN_RATE = float(os.getenv("DRAIN_RATE", "0.1"))
+DRAIN_RATE = float(os.getenv("DRAIN_RATE", "0.02"))
 LOW_BATTERY_THRESHOLD = float(os.getenv("LOW_BATTERY_THRESHOLD", "15"))
 # Drive calibration: how fast the car goes at MOTOR_POWER throttle. Measure
 # these on the real car so "forward 1 m" and "left 90" come out right.
@@ -52,6 +53,12 @@ FLOOR4_BUILDING = {"x": 50.0, "y": 50.0}
 # START_X/START_Y put a simulated robot at a chosen campus spot (default: random);
 # START_DOOR (e.g. 411-1) starts a robot on the 4th floor at that door instead of the elevator.
 START_DOOR = os.getenv("START_DOOR", "")
+# Where this robot waits on the 4th floor and returns to after a delivery there (default: the
+# door it starts at, e.g. the car parked at 411-1). Without one, a simulated robot rides the
+# elevator back down after delivering, so only parked robots count as close to a floor-4 failure.
+HOME_DOOR = os.getenv("HOME_DOOR", START_DOOR)
+if HOME_DOOR.lower() in ("none", "off", "0"):
+    HOME_DOOR = ""
 START_SPACE = os.getenv("START_SPACE", "campus" if motors.DRIVER == "sim" and not START_DOOR else "floor4")
 # Visual-only campus travel: how fast a simulated robot crosses the map, in meters per
 # second. Slow on purpose so the dashboard can show it following the roads.
@@ -112,13 +119,16 @@ def responsive() -> bool:
 
 
 async def registry_robots() -> list[dict]:
-    async with httpx.AsyncClient(timeout=3.0) as client:
+    async with httpx.AsyncClient(timeout=1.0) as client:
         r = await client.get(f"http://{REGISTRY}/api/registry")
         return r.json()["robots"]
 
 
 async def notify_peers(event: str, details: dict):
-    """Send an automatic event to every other registered robot."""
+    """Send an automatic event to every other registered robot, all at once.
+
+    A peer that is down or unreachable only costs one short timeout, and callers that
+    must not wait (a robot being failed or stopped) run this in the background."""
     if not state["id"]:
         return
     body = {"event": event, "robot": state["id"], **details}
@@ -126,10 +136,9 @@ async def notify_peers(event: str, details: dict):
         robots = await registry_robots()
     except (httpx.HTTPError, KeyError, ValueError):
         return
-    async with httpx.AsyncClient(timeout=3.0) as client:
-        for peer in robots:
-            if peer["name"] == state["id"]:
-                continue
+
+    async with httpx.AsyncClient(timeout=1.0) as client:
+        async def tell(peer):
             try:
                 await client.post(
                     f"http://{peer['host']}:{peer['port']}/message",
@@ -139,6 +148,18 @@ async def notify_peers(event: str, details: dict):
                 # A peer may be powered off or unreachable; the local robot
                 # continues operating and can retry through later policies.
                 pass
+
+        await asyncio.gather(*(tell(peer) for peer in robots if peer["name"] != state["id"]))
+
+
+background_tasks: set[asyncio.Task] = set()
+
+
+def notify_in_background(event: str, details: dict):
+    """Fire-and-forget notify_peers, so state changes and replies aren't delayed by slow peers."""
+    task = asyncio.create_task(notify_peers(event, details))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
 
 async def read_real_battery():
@@ -150,6 +171,40 @@ async def read_real_battery():
         return
     state["battery"] = float(reading["percent"])
     state["battery_voltage"] = reading["voltage"]
+
+
+def abort_active_tasks(reason: str):
+    """Stop whatever the robot is doing now. The tasks are marked failed with `reason`, so the
+    orchestrator hands them to another robot instead of waiting for a timeout."""
+    for task_id, worker in list(task_workers.items()):
+        task = tasks.get(task_id)
+        if task and task["status"] in ("acknowledged", "running"):
+            task["status"] = "failed"
+            task["error"] = reason
+            task["completed_at"] = now()
+        if worker and not worker.done():
+            worker.cancel()
+    if navigator.queue:
+        navigator.cancel()
+    if motors.DRIVER != "sim":
+        stop_motors()
+
+
+def enter_low_battery():
+    """Battery ran low: stop the current task and return to charge (takes no new tasks)."""
+    global low_battery_notified
+    low_battery_notified = True
+    state["mode"] = "returning_to_charge"
+    state["accepting_tasks"] = False
+    abort_active_tasks("robot became low on battery")
+    notify_in_background(
+        "battery_low",
+        {
+            "battery": state["battery"],
+            "action": "returning_to_charge",
+            "message": f"{state['id']} battery is low",
+        },
+    )
 
 
 async def battery_loop():
@@ -172,19 +227,9 @@ async def battery_loop():
                 not low_battery_notified
                 and 0 < state["battery"] < LOW_BATTERY_THRESHOLD
             ):
-                low_battery_notified = True
-                state["mode"] = "returning_to_charge"
-                state["accepting_tasks"] = False
-                await notify_peers(
-                    "battery_low",
-                    {
-                        "battery": state["battery"],
-                        "action": "returning_to_charge",
-                        "message": f"{state['id']} battery is low",
-                    },
-                )
+                enter_low_battery()
             if state["battery"] == 0:
-                await notify_peers(
+                notify_in_background(
                     "battery_dead",
                     {
                         "battery": 0,
@@ -230,7 +275,7 @@ async def monitor_peers():
                 peer_health[name] = is_healthy
 
                 if previous is True and not is_healthy:
-                    await notify_peers(
+                    notify_in_background(
                         "peer_unresponsive",
                         {
                             "peer": name,
@@ -265,7 +310,7 @@ async def navigation_loop():
                 stop_motors()
         # Only take over mode/position while a floor route is active, so the
         # battery and drive logic keep control the rest of the time.
-        if navigating:
+        if navigating and responsive() and not low_battery_notified:
             state["mode"] = navigator.mission["phase"]
             state["accepting_tasks"] = False
             # On the campus map a robot inside the building sits at the building.
@@ -317,13 +362,19 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    await notify_peers(
-        "robot_offline",
-        {
-            "action": "powered_off",
-            "message": f"{state['id']} is shutting down",
-        },
-    )
+    try:
+        await asyncio.wait_for(
+            notify_peers(
+                "robot_offline",
+                {
+                    "action": "powered_off",
+                    "message": f"{state['id']} is shutting down",
+                },
+            ),
+            timeout=1.5,  # a stopping container must not hang on unreachable peers
+        )
+    except asyncio.TimeoutError:
+        pass
 
 
 # ---- observability ----------------------------------------------------------
@@ -507,6 +558,23 @@ def leave_floor4():
     state["space"] = "campus"
     state["position"] = dict(FLOOR4_BUILDING)
     state["navigation"] = navigator.mission
+
+
+async def return_after_delivery(delivered_door: str):
+    """After a floor-4 delivery: back to the home door, or down the elevator to the campus."""
+    try:
+        if HOME_DOOR:
+            if delivered_door != HOME_DOOR:
+                await drive_floor_route([{"door_id": HOME_DOOR}])
+        elif motors.DRIVER == "sim":
+            await drive_floor_route(ELEVATOR_STOP)
+            leave_floor4()
+    except RuntimeError as exc:  # failed, drained or already on a route: nothing more to do
+        print(f"return after delivery stopped: {exc}", flush=True)
+    finally:
+        if not navigator.queue and responsive() and not low_battery_notified:
+            state["mode"] = "available"
+            state["accepting_tasks"] = True
 
 
 def delivery_stops(payload: dict) -> list[dict]:
@@ -704,9 +772,16 @@ async def run_task(task_id: str):
 
         task["status"] = "completed"
         task["completed_at"] = now()
+        door_id = (task["payload"].get("destination") or {}).get("door_id")
+        if task["type"] == "deliver_package" and door_id and state["space"] == "floor4" and (HOME_DOOR or motors.DRIVER == "sim"):
+            state["accepting_tasks"] = False  # no new task between this delivery and the trip back
+            ret = asyncio.create_task(return_after_delivery(door_id))
+            background_tasks.add(ret)
+            ret.add_done_callback(background_tasks.discard)
     except asyncio.CancelledError:
-        task["status"] = "cancelled"
-        task["error"] = "worker cancelled"
+        if task["status"] not in ("failed", "cancelled"):  # abort_active_tasks / cancel already said why
+            task["status"] = "cancelled"
+            task["error"] = "worker cancelled"
         raise
     except Exception as exc:
         task["status"] = "failed"
@@ -825,7 +900,7 @@ async def control(ctrl: Control):
         if ctrl.status not in ("alive", "dead", "no_response"):
             raise HTTPException(status_code=400, detail="invalid status")
         if ctrl.status != "alive" and state["status"] == "alive":
-            await notify_peers(
+            notify_in_background(
                 "robot_status",
                 {
                     "status": ctrl.status,
@@ -837,6 +912,7 @@ async def control(ctrl: Control):
         if ctrl.status != "alive":
             state["mode"] = "unavailable"
             state["accepting_tasks"] = False
+            abort_active_tasks(f"robot became {ctrl.status}")  # a failed robot stops at once
     if ctrl.battery is not None:
         state["battery"] = max(0.0, min(100.0, ctrl.battery))
         if state["battery"] > LOW_BATTERY_THRESHOLD:
@@ -844,8 +920,11 @@ async def control(ctrl: Control):
             if state["status"] == "alive":
                 state["mode"] = "available"
                 state["accepting_tasks"] = True
+        elif state["battery"] > 0 and state["status"] == "alive" and not low_battery_notified:
+            enter_low_battery()  # drained: give up the task now, not on the next battery tick
         if state["battery"] == 0:
             state["status"] = "dead"
+            abort_active_tasks("robot became dead")
     return state
 
 

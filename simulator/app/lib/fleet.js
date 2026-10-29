@@ -8,9 +8,16 @@ import { forgetRobot, getRobot, listRobots } from "./registry";
 // container runs on this machine's Docker can also be powered on/off.
 // Docker Desktop's user-level installation on macOS does not create /var/run/docker.sock.
 const userSocket = join(homedir(), ".docker", "run", "docker.sock");
-const docker = new Docker(!process.env.DOCKER_HOST && !existsSync("/var/run/docker.sock") && existsSync(userSocket)
-  ? { socketPath: userSocket }
-  : undefined);
+// Docker Desktop holds back, for about 3 seconds, every API request that does not look like it
+// comes from the Docker client. That made each dashboard refresh (and every FAIL/STOP click) wait
+// 3 s, so requests identify themselves as the Docker CLI.
+const docker = new Docker({
+  ...(!process.env.DOCKER_HOST && !existsSync("/var/run/docker.sock") && existsSync(userSocket)
+    ? { socketPath: userSocket }
+    : {}),
+  headers: { "User-Agent": "Docker-Client/27.0.0 (lastmile-dashboard)" },
+});
+const STALE_MS = 60_000; // silent this long with no local container => forgotten
 const ONLINE_MS = 10_000; // no heartbeat for this long => robot is offline
 
 function isFresh(robot) {
@@ -64,6 +71,10 @@ export async function getFleet() {
   for (const robot of listRobots()) {
     const removed = dockerUp && local.has(robot.host) && !containers.has(`${robot.host}:${robot.port}`);
     if (removed && !isFresh(robot)) forgetRobot(robot.name);
+    // A robot with no container here (for example the car, once switched off) that has been silent
+    // for a minute is gone; it registers again, under the lowest free name, if it comes back.
+    const container = containers.get(`${robot.host}:${robot.port}`);
+    if (!container && Date.now() - robot.lastSeen > STALE_MS) forgetRobot(robot.name);
   }
   return Promise.all(
     listRobots().map(async (robot) => {

@@ -35,9 +35,14 @@ REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:3000/api/registry").r
 ROBOT_AUTH_TOKEN = os.getenv("ROBOT_AUTH_TOKEN", "")
 LOCAL_HOST_IP = os.getenv("LOCAL_HOST_IP", "")
 LOCAL_ROBOT_HOST = os.getenv("LOCAL_ROBOT_HOST", "127.0.0.1")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "30"))
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "45"))
+# When the main model hasn't answered after GEMINI_HEDGE_SECONDS (or fails outright), the same
+# request also goes to the next model here, and the first answer wins. Google's models are
+# sometimes overloaded for tens of seconds at a time.
+GEMINI_FALLBACK_MODELS = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3-flash-preview,gemini-3.5-flash-lite").split(",") if m.strip()]
+GEMINI_HEDGE_SECONDS = float(os.getenv("GEMINI_HEDGE_SECONDS", "4"))
 TASK_TIMEOUT_SECONDS = float(os.getenv("TASK_TIMEOUT_SECONDS", "15"))
 MAX_TASK_RETRIES = int(os.getenv("MAX_TASK_RETRIES", "1"))
 AUTOPILOT_MAX_STEPS = int(os.getenv("AUTOPILOT_MAX_STEPS", "20"))
@@ -62,6 +67,7 @@ CAMPUS_BUILDINGS = json.loads((Path(__file__).resolve().parent / "campus_buildin
 for building_name, spot in CAMPUS_BUILDINGS.items():
     KNOWN_LOCATIONS.setdefault(building_name.lower(), {"x": spot["x"], "y": spot["y"]})
 METERS_PER_UNIT = 2.0  # the dashboard's 0-100 grid spans 200 m
+FLOOR4_ENTRY_METERS = float(os.getenv("FLOOR4_ENTRY_METERS", "60"))  # extra cost for a robot outside to reach the 4th floor
 
 
 def load_floor4():
@@ -128,6 +134,73 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+# Models that just failed are skipped for a while: a model whose free daily quota is used up
+# (429) stays unusable for hours, an overloaded one (503) usually recovers within seconds.
+model_cooldown: dict[str, float] = {}
+
+
+def cool_down(model: str, error: Exception):
+    text = str(error)
+    if "429" in text or "RESOURCE_EXHAUSTED" in text:
+        seconds = 1800
+    elif "404" in text or "NOT_FOUND" in text:
+        seconds = 3600
+    elif "503" in text or "UNAVAILABLE" in text or "500" in text:
+        seconds = 20
+    else:
+        return
+    model_cooldown[model] = time.time() + seconds
+
+
+async def generate(contents, config):
+    """Ask Gemini, racing backup models when the main one is slow or failing.
+
+    Returns (response, model that answered). Raises asyncio.TimeoutError after
+    GEMINI_TIMEOUT_SECONDS, or RuntimeError if every model failed.
+    """
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
+    usable = [m for m in models if model_cooldown.get(m, 0) <= time.time()]
+    models = usable or models  # if every model is cooling down, try them all anyway
+    pending: dict[asyncio.Task, str] = {}
+    errors: list[str] = []
+    started = time.time()
+    next_model = 0
+
+    def launch():
+        nonlocal next_model
+        model = models[next_model]
+        next_model += 1
+        pending[asyncio.ensure_future(client.aio.models.generate_content(
+            model=model, contents=contents, config=config))] = model
+
+    launch()
+    try:
+        while True:
+            remaining = started + GEMINI_TIMEOUT_SECONDS - time.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            more = next_model < len(models)
+            done, _ = await asyncio.wait(
+                pending, timeout=min(remaining, GEMINI_HEDGE_SECONDS) if more else remaining,
+                return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                model = pending.pop(task)
+                if task.exception() is None:
+                    print(f"gemini: {model} answered in {time.time() - started:.1f} s", flush=True)
+                    return task.result(), model
+                cool_down(model, task.exception())
+                errors.append(f"{model}: {type(task.exception()).__name__}: {str(task.exception())[:150]}")
+                print(f"gemini: {errors[-1]}", flush=True)
+            if more and (not done or not pending):  # slow, or everything so far failed
+                launch()
+            elif not pending:
+                raise RuntimeError("; ".join(errors))
+    finally:
+        for task in pending:
+            task.cancel()
+
+
 def robot_headers():
     return {"Authorization": f"Bearer {ROBOT_AUTH_TOKEN}"} if ROBOT_AUTH_TOKEN else {}
 
@@ -162,7 +235,21 @@ def robot_url(robot):
 ROBOT_STATE_TIMEOUT = float(os.getenv("ROBOT_STATE_TIMEOUT", "1.5"))
 
 
+_snapshot: dict = {"at": 0.0, "task": None}
+SNAPSHOT_REUSE_SECONDS = 0.3
+
+
 async def fleet_snapshot():
+    """The fleet, shared between callers: the dashboard, the task watcher and every
+    active task all ask at once, so asks within a fraction of a second reuse one lookup."""
+    task = _snapshot["task"]
+    if task is None or (task.done() and time.time() - _snapshot["at"] > SNAPSHOT_REUSE_SECONDS):
+        task = _snapshot["task"] = asyncio.ensure_future(_fleet_snapshot())
+        _snapshot["at"] = time.time()
+    return await asyncio.shield(task)
+
+
+async def _fleet_snapshot():
     """Every registered robot with its state, asked in parallel so one unreachable
     robot costs one short timeout instead of delaying everything."""
     async with httpx.AsyncClient(timeout=3) as client:
@@ -262,7 +349,9 @@ def travel_distance(robot_state: dict, target: dict) -> float:
         spot = (float(target["u"]), float(target["v"]))
         if on_floor:
             return floor4_distance(here, spot)
-        return campus(position, building) + floor4_distance(elevator, spot)
+        # A robot outside still has to get into the building and wait for the elevator, so a
+        # robot already on this floor (such as the car parked at room 411) is preferred.
+        return campus(position, building) + FLOOR4_ENTRY_METERS + floor4_distance(elevator, spot)
     if on_floor:
         return floor4_distance(here, elevator) + campus(building, target)
     return campus(position, target)
@@ -589,7 +678,7 @@ def gemini_tools():
     return [types.Tool(function_declarations=[move_tool, delivery_tool, drive_tool, autopilot_tool])]
 
 
-TASK_WATCH_SECONDS = float(os.getenv("TASK_WATCH_SECONDS", "1"))
+TASK_WATCH_SECONDS = float(os.getenv("TASK_WATCH_SECONDS", "0.5"))
 
 
 async def watch_tasks():
@@ -685,6 +774,10 @@ async def get_task(task_id: str):
             )
             if response.status_code == 200:
                 task.update(response.json())
+                # The robot itself gave the task up because it failed or ran low on battery
+                # (it may say so before our fleet check sees it): hand the task on.
+                if task["status"] == "failed" and str(task.get("error", "")).startswith("robot became"):
+                    return await reassign_or_fail(task, task["error"])
     except (httpx.HTTPError, ValueError):
         return await reassign_or_fail(task, "robot status check failed")
     return task
@@ -801,11 +894,12 @@ async def chat(req: ChatRequest):
         fleet = await fleet_snapshot()
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"fleet unavailable: {exc}")
+    keep = ("status", "mode", "accepting_tasks", "battery", "space", "position", "camera")
     fleet_context = [
         {
             "name": robot["name"],
             "reachable": robot["reachable"],
-            "state": robot["state"],
+            "state": {k: robot["state"].get(k) for k in keep} if robot["state"] else None,
         }
         for robot in fleet
     ]
@@ -831,24 +925,16 @@ async def chat(req: ChatRequest):
         "4th floor (for example 407) are delivery destinations: pass the room number as "
         "destination (a specific door as 405-1; door A of a room is its first door), and pass where the package comes from (for example cpace) as "
         "pickup. If a robot dies mid-delivery the system hands the package to the robot "
-        "closest to where it died. The map uses "
+        "closest to where it died; a car parked on the 4th floor (for example at room 411) is "
+        "closest to a failure there, so you do not need to choose it yourself. The map uses "
         "x and y from 0 to 100; interpret top "
         "right as approximately (90, 90), top left as (10, 90), bottom right "
         "as (90, 10), and bottom left as (10, 10).\n\n"
         f"Fleet snapshot:\n{fleet_context}\n\nUser request: {req.message}"
     )
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    started = time.time()
     try:
         # Async, so a slow Gemini answer doesn't freeze fleet polling and task watching.
-        response = await asyncio.wait_for(
-            client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(tools=gemini_tools()),
-            ),
-            timeout=GEMINI_TIMEOUT_SECONDS,
-        )
+        response, _ = await generate(prompt, types.GenerateContentConfig(tools=gemini_tools()))
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail=f"Gemini did not answer within {GEMINI_TIMEOUT_SECONDS:g} s; try again")
     except Exception as exc:
@@ -856,7 +942,6 @@ async def chat(req: ChatRequest):
             status_code=502,
             detail=f"Gemini request failed ({type(exc).__name__}): {exc}",
         )
-    print(f"chat: Gemini answered in {time.time() - started:.1f} s", flush=True)
     calls = getattr(response, "function_calls", None) or []
     if not calls:
         return {"message": response.text, "executed": None}
@@ -1061,7 +1146,6 @@ async def wait_for_drive(task_id: str) -> dict:
 
 
 async def run_autopilot(mission: dict):
-    client = genai.Client(api_key=GEMINI_API_KEY)
     config = types.GenerateContentConfig(
         tools=autopilot_tools(),
         tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY")),
@@ -1072,13 +1156,9 @@ async def run_autopilot(mission: dict):
             mission["phase"] = "looking"
             frame = await camera_frame(mission["robot_id"])
             mission["phase"] = "thinking"
-            response = await client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[
-                    types.Part.from_bytes(data=frame, mime_type="image/jpeg"),
-                    autopilot_prompt(mission, step),
-                ],
-                config=config,
+            response, _ = await generate(
+                [types.Part.from_bytes(data=frame, mime_type="image/jpeg"), autopilot_prompt(mission, step)],
+                config,
             )
             calls = getattr(response, "function_calls", None) or []
             if not calls:

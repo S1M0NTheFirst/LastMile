@@ -25,10 +25,11 @@ export function register({ host, port, name }) {
   let assigned;
   if (hint && !store.robots.has(name)) {
     assigned = name;
-    store.next = Math.max(store.next, Number(hint[1]) + 1);
   } else {
-    while (store.robots.has(`robot${store.next}`)) store.next++;
-    assigned = `robot${store.next++}`;
+    // The lowest free number, so names start again at robot0 after the robots are cleared.
+    let n = 0;
+    while (store.robots.has(`robot${n}`)) n++;
+    assigned = `robot${n}`;
   }
 
   const robot = { name: assigned, host, port, lastSeen: Date.now() };
@@ -49,4 +50,15 @@ export function getRobot(name) {
 // Drops a robot whose container was removed, so it stops showing as "off".
 export function forgetRobot(name) {
   store.robots.delete(name);
+}
+
+// Drops the robot registered at host:port; returns its name, or null if there was none.
+export function forgetByAddress(host, port) {
+  for (const r of store.robots.values()) {
+    if (r.host === host && r.port === port) {
+      store.robots.delete(r.name);
+      return r.name;
+    }
+  }
+  return null;
 }
