@@ -3,7 +3,7 @@
 The robot container can't reach the car's I2C boards or the CSI camera, so
 with MOTOR_DRIVER=jetracer it talks to this server over HTTP instead:
 
-    ROBOT_AUTH_TOKEN=lastmile-local-secret python3 motor_bridge.py
+    ROBOT_AUTH_TOKEN=<your-token> python3 motor_bridge.py
 
     POST /drive        {"throttle": -1..1, "steering": -1..1}
     GET  /battery      {"voltage": 11.8, "percent": 78}, from the INA219 chip

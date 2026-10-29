@@ -17,7 +17,7 @@ export GOOGLE_CLOUD_PROJECT="<your-google-cloud-project>"
 export GOOGLE_CLOUD_LOCATION="global"
 export REGISTRY_URL="http://<machine-b-ip>:3000/api/registry"
 export GEMINI_MODEL="gemini-3.8-flash"
-export ROBOT_AUTH_TOKEN="a-shared-local-secret"
+export ROBOT_AUTH_TOKEN="<your-token>"
 
 orchestrator/.venv/bin/uvicorn orchestrator.app:app --host 0.0.0.0 --port 8001
 ```
@@ -31,7 +31,7 @@ Set the same token in the shell before running `join.py` on Machine A and
 Machine B:
 
 ```bash
-export ROBOT_AUTH_TOKEN="a-shared-local-secret"
+export ROBOT_AUTH_TOKEN="<your-token>"
 python3 join.py --registry <machine-b-ip>:3000 --count 2
 ```
 
