@@ -11,7 +11,7 @@ client = genai.Client(
 )
 
 response = client.models.generate_content(
-    model="gemini-3.5-flash",
+    model="gemini-3.8-flash",
     contents=(
         "You are an AI fleet recovery planner. "
         "Robot-1 failed during delivery task-101. "
