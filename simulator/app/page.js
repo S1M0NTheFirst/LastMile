@@ -817,7 +817,7 @@ const MAP_CACHE_KEY = `csulb-ecs-layout-v2-r${WORLD_RADIUS}`;
 // Ask both Overpass servers, staggered: the backup starts if the main server hasn't answered
 // within HEDGE_MS (or fails sooner). First good answer wins; the other request is cancelled.
 const HEDGE_MS = 2500;
-const OVERPASS_TIMEOUT_MS = 30000;
+const OVERPASS_TIMEOUT_MS = 70000;
 
 function overpass(query, onProgress = () => {}) {
   const body = "data=" + encodeURIComponent(query);
@@ -857,7 +857,10 @@ function overpass(query, onProgress = () => {}) {
             bytes += value.length;
             if (!settled) onProgress(`Downloading map data… ${Math.round(bytes / 1024)} KB`);
           }
-          return JSON.parse(new TextDecoder().decode(await new Blob(chunks).arrayBuffer()));
+          const data = JSON.parse(new TextDecoder().decode(await new Blob(chunks).arrayBuffer()));
+          // A busy server answers HTTP 200 with a "remark" and no (or partial) data; treat as a failure.
+          if (data.remark && /error|timed out|timeout|memory|rate/i.test(data.remark)) throw new Error(`${host}: ${data.remark}`);
+          return data;
         })
         .then((data) => finish(resolve, data))
         .catch((e) => {
@@ -1083,7 +1086,7 @@ const featureQuery = (at) => `
   node${at}["natural"="tree"];
   node${at}["entrance"];`;
 // Short declared limits get scheduled sooner on the public Overpass servers.
-const QUERY_HEAD = "[out:json][timeout:25][maxsize:33554432];";
+const QUERY_HEAD = "[out:json][timeout:60][maxsize:33554432];";
 // Overpass measures "around" to way segments, so long paths crossing the perimeter are
 // still caught; a few meters of slack covers rounding.
 const FETCH_RADIUS = WORLD_RADIUS + 10;
@@ -1240,7 +1243,20 @@ function fetchCampusLayout(onProgress = () => {}) {
   const report = (msg) => listeners.forEach((fn) => fn(msg));
   const t0 = performance.now();
   const promise = (async () => {
-    const { center, raw } = await downloadAroundEcs(report);
+    let result, lastErr;
+    for (let attempt = 1; attempt <= 3 && !result; attempt++) {
+      try {
+        result = await downloadAroundEcs(report);
+      } catch (e) {
+        lastErr = e;
+        if (attempt < 3) {
+          report(`Map server busy (${e.message}); retrying ${attempt + 1}/3…`);
+          await new Promise((r) => setTimeout(r, 3000 * attempt));
+        }
+      }
+    }
+    if (!result) throw lastErr;
+    const { center, raw } = result;
     report("Building 3D campus…");
     const layout = build(center, raw);
     try {
@@ -1261,7 +1277,7 @@ function fetchCampusLayout(onProgress = () => {}) {
 // Robots still report positions on a 0-100 grid; that grid now spans the full
 // 200 m square around the 100 m perimeter, so each robot unit = 2 m and (50, 50) is ECS.
 // y increases northward, matching the old hallway's orientation.
-const ROBOT_SPAN = WORLD_RADIUS * 2;
+const ROBOT_SPAN = 400; // fixed robot coordinate span (meters); independent of how much map is drawn
 function toScene(pos) {
   const p = pos || { x: 50, y: 50 };
   return { x: (p.x / 100 - 0.5) * ROBOT_SPAN, z: (0.5 - p.y / 100) * ROBOT_SPAN };
@@ -1455,13 +1471,13 @@ function legRoute(leg) {
   return route;
 }
 
-const HOME = new THREE.Vector3(0, 125, 140); // overview camera: whole 100 m radius in frame
+const HOME = new THREE.Vector3(0, 125, 140); // overview camera: whole campus radius in frame
 const BASE_FOV = 55;
 // Zoom limits per camera mode. Overview zooms by camera distance, Follow by how far
 // behind the robot the camera trails, Robot POV by narrowing the field of view.
 const ZOOM = {
   step: 1.35, // one button press / key press
-  overview: { min: 6, max: 600 }, // meters from the orbit target
+  overview: { min: 6, max: 700 }, // meters from the orbit target
   follow: { min: 0.25, max: 5 }, // multiplier on the default follow offset
   pov: { minFov: 12, maxFov: 90 },
 };
@@ -1573,8 +1589,8 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(PALETTE.sky);
     // Max camera distance is 360 m; keep the full 100 m campus visible from there.
-    scene.fog = new THREE.Fog(PALETTE.sky, 500, 1100);
-    const cam = new THREE.PerspectiveCamera(55, 1, 0.1, 2000);
+    scene.fog = new THREE.Fog(PALETTE.sky, 1000, 2400);
+    const cam = new THREE.PerspectiveCamera(55, 1, 0.1, 4000);
     cam.position.copy(HOME);
     const ren = new THREE.WebGLRenderer({ antialias: true });
     ren.localClippingEnabled = true; // used to cut away ECS above the 4th floor in the 4F view
@@ -1586,9 +1602,11 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     scene.add(sun);
 
     // Overview camera can be orbited / panned / zoomed around the campus.
-    // Free map navigation: left-drag pans anywhere, right-drag rotates/tilts, wheel zooms
-    // toward the cursor. WASD / arrow keys also pan.
+    // Free map navigation: left-drag moves anywhere on the map; Shift+left-drag or right-drag
+    // spins 360° / tilts around whatever spot is in the middle of the screen (not ECS);
+    // wheel zooms toward the cursor. WASD / arrow keys also pan.
     const controls = new MapControls(cam, ren.domElement);
+    controls.rotateSpeed = 0.6;
     controls.target.set(0, 0, 0);
     controls.zoomToCursor = true;
     controls.listenToKeyEvents(window);
@@ -2140,6 +2158,17 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         cam.lookAt(controls.target);
         if (cam.position.distanceTo(flyTo.pos) < 0.5) returning = false;
       } else {
+        const zr = zoomRef.current;
+        controls.autoRotate = !!zr.spin;
+        controls.autoRotateSpeed = 1.5;
+        let turn = zr.rotate || 0;
+        zr.rotate = 0;
+        if (panKeys.has("q")) turn += 1.2 * dt;
+        if (panKeys.has("e")) turn -= 1.2 * dt;
+        if (turn) {
+          // Orbit the camera around the current target (360° view of the map).
+          cam.position.sub(controls.target).applyAxisAngle(THREE.Object3D.DEFAULT_UP, turn).add(controls.target);
+        }
         if (panKeys.size && !tracking) {
           const speed = cam.position.distanceTo(controls.target) * 0.9 * dt;
           const f = tmp.subVectors(controls.target, cam.position).setY(0).normalize();
@@ -2324,7 +2353,8 @@ export default function Page() {
   const uiRef = useRef({ view, trails, selected });
   const onPick = useRef(null);
   const onWorld = useRef(setWorld);
-  const zoomRef = useRef({ pending: 0, reset: false });
+  const zoomRef = useRef({ pending: 0, reset: false, rotate: 0, spin: false });
+  const [spin, setSpin] = useState(false);
   const [floorInfo, setFloorInfo] = useState(null);
   const onFloor = useRef(setFloorInfo);
   const onZoom = useRef(setZoomLevel);
@@ -2620,6 +2650,13 @@ export default function Page() {
             <button className="btn zoom-level" onClick={zoomReset} title="Reset zoom (0)">{zoomLevel.toFixed(1)}×</button>
             <button className="btn" onClick={zoomIn} title="Zoom in (+)" aria-label="Zoom in">+</button>
           </div>
+          {view !== "follow" && view !== "pov" && (
+            <div className="zoom" role="group" aria-label="Rotate map">
+              <button className="btn" onClick={() => { zoomRef.current.rotate += Math.PI / 4; }} title="Rotate left 45° (Q)">⟲</button>
+              <button className={`btn ${spin ? "active" : ""}`} onClick={() => { zoomRef.current.spin = !spin; setSpin(!spin); }} title="Spin 360° around the view">360°</button>
+              <button className="btn" onClick={() => { zoomRef.current.rotate -= Math.PI / 4; }} title="Rotate right 45° (E)">⟳</button>
+            </div>
+          )}
         </div>
       </div>
 
