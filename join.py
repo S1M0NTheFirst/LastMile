@@ -143,7 +143,7 @@ def start(args):
         if args.motor_driver:
             run_args += ["-e", f"MOTOR_DRIVER={args.motor_driver}"]
         # Drive calibration (see robot/app.py), passed through when set in the shell.
-        for name in ("DRIVE_SPEED", "TURN_SPEED", "MOTOR_POWER", "MAX_MOTOR_POWER", "MAX_DRIVE_METERS", "START_SPACE", "START_DOOR", "CAMPUS_SPEED", "DRAIN_RATE"):
+        for name in ("DRIVE_SPEED", "TURN_SPEED", "MOTOR_POWER", "MAX_MOTOR_POWER", "MIN_MOTOR_POWER", "MAX_DRIVE_METERS", "START_SPACE", "START_DOOR", "START_FACING", "CAMPUS_SPEED", "DRAIN_RATE"):
             if os.getenv(name):
                 run_args += ["-e", f"{name}={os.getenv(name)}"]
         run_args += [IMAGE]

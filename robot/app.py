@@ -40,6 +40,9 @@ MOTOR_POWER = float(os.getenv("MOTOR_POWER", "0.3"))   # throttle 0-1 used for d
 # here. DRIVE_SPEED and TURN_SPEED are measured at MOTOR_POWER and assumed to
 # scale with throttle, so distances are only approximate at other speeds.
 MAX_MOTOR_POWER = float(os.getenv("MAX_MOTOR_POWER", "1.0"))
+# Lowest throttle a real car is given on a map route (the slow approach to a door would otherwise
+# send ~0.11, which doesn't move it). Raise it if the car still stalls; the map speed follows.
+MIN_MOTOR_POWER = float(os.getenv("MIN_MOTOR_POWER", "0.3"))
 # Largest amount one drive step may ask for: degrees for turns, and meters for
 # straight runs only when MAX_DRIVE_METERS is set (no distance cap by default).
 MAX_DRIVE_METERS = float(os.getenv("MAX_DRIVE_METERS", "inf"))
@@ -56,7 +59,10 @@ START_DOOR = os.getenv("START_DOOR", "")
 # Where this robot waits on the 4th floor and returns to after a delivery there (default: the
 # door it starts at, e.g. the car parked at 411-1). Without one, a simulated robot rides the
 # elevator back down after delivering, so only parked robots count as close to a floor-4 failure.
-HOME_DOOR = os.getenv("HOME_DOOR", START_DOOR)
+# START_FACING=right|left|wall: the car is parked in the hallway at START_DOOR facing along it
+# (right = toward room 405), or with its back to the door facing the opposite wall (wall). It then stays where it delivers.
+START_FACING = os.getenv("START_FACING", "").lower()
+HOME_DOOR = os.getenv("HOME_DOOR", "" if START_FACING else START_DOOR)
 if HOME_DOOR.lower() in ("none", "off", "0"):
     HOME_DOOR = ""
 START_SPACE = os.getenv("START_SPACE", "campus" if motors.DRIVER == "sim" and not START_DOOR else "floor4")
@@ -76,6 +82,7 @@ def make_navigator() -> Navigator:
         speed=step_rate({"action": "forward", "speed": MOTOR_POWER}),
         turn_speed=math.radians(step_rate({"action": "left", "speed": MOTOR_POWER})),
         power=MOTOR_POWER,
+        min_power=MIN_MOTOR_POWER,
     )
 
 
@@ -525,7 +532,7 @@ if START_SPACE == "floor4":
     if START_DOOR:
         if START_DOOR not in DOORS or not DOORS[START_DOOR]["branch"]:
             raise RuntimeError(f"START_DOOR {START_DOOR!r} is not a placed door; use an id such as 411-1")
-        navigator.place_at_door(START_DOOR)
+        navigator.place_at_door(START_DOOR, START_FACING or None)
     else:
         navigator.place_at_elevator()
     state["position"] = dict(FLOOR4_BUILDING)

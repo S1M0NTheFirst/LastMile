@@ -64,7 +64,7 @@ pkill -f motor_bridge.py; pkill -f camera_worker.py; cd ~/LastMile/robot
 ```
 
 ```bash
-THROTTLE_GAIN=1 ROBOT_AUTH_TOKEN=lastmile-local-secret FLIP_THROTTLE=1 FLIP_STEERING=1 setsid nohup python3 motor_bridge.py > ~/bridge.log 2>&1 < /dev/null &
+STEERING_OFFSET=-0.08 THROTTLE_GAIN=1 ROBOT_AUTH_TOKEN=lastmile-local-secret FLIP_THROTTLE=1 FLIP_STEERING=1 setsid nohup python3 motor_bridge.py > ~/bridge.log 2>&1 < /dev/null &
 ```
 
 ```bash
@@ -77,12 +77,12 @@ If the camera fails, run `sudo systemctl restart nvargus-daemon` before starting
 
 ## 5. Mac: connect the car at room 411 (Terminal 3)
 
-Put the car by the door of room 411, facing the door. It stays parked there on the 4th-floor map, and a
+Put the car in the middle of the hallway in front of room 411's door, facing along the hallway toward room 405. It stays parked there on the 4th-floor map, and a
 robot that fails on the 4th floor is taken over by the closest robot, which is the car. Start the car
 **before** the Docker robots so it is `robot0`.
 
 ```bash
-MAC=$(ipconfig getifaddr en0); ssh jetson@192.168.137.106 "cd ~/LastMile && python3 join.py --stop && START_DOOR=411-1 ROBOT_AUTH_TOKEN=lastmile-local-secret MOTOR_POWER=0.5 DRIVE_SPEED=0.6 python3 join.py --registry $MAC:3000 --host-ip 192.168.137.106 --count 1 --motor-driver jetracer"
+MAC=$(ipconfig getifaddr en0); ssh jetson@192.168.137.106 "cd ~/LastMile && python3 join.py --stop && START_DOOR=411-1 START_FACING=right ROBOT_AUTH_TOKEN=lastmile-local-secret MOTOR_POWER=0.5 DRIVE_SPEED=1.05 python3 join.py --registry $MAC:3000 --host-ip 192.168.137.106 --count 1 --motor-driver jetracer"
 ```
 
 The car appears on the dashboard within about 10 seconds. It builds a Docker image the first time, which takes a minute.

@@ -746,8 +746,8 @@ async def get_task(task_id: str):
     task = tasks.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    if task["status"] in ("completed", "failed", "cancelled", "reassigned"):
-        return task
+    if task["status"] in ("completed", "failed", "cancelled", "reassigned", "reassigning"):
+        return task  # (a task that is being handed on is left alone until that finishes)
 
     # Refresh the task from the robot so the dashboard sees running/completed
     # rather than only the initial acknowledgement. This is also where the
@@ -762,6 +762,15 @@ async def get_task(task_id: str):
             # A robot clears accepting_tasks while it drives a floor route, so
             # only a low-battery return counts as giving the task up.
             unavailable = unavailable or robot["state"].get("mode") == "returning_to_charge"
+
+        gone = bool(robot) is False or not robot["reachable"] or not robot["state"]
+        if unavailable and gone and not expired:
+            # One missed answer can be a hiccup; two in a row (about a second) means it is gone.
+            task["missed_checks"] = task.get("missed_checks", 0) + 1
+            if task["missed_checks"] < 2:
+                return task
+        elif not gone:
+            task["missed_checks"] = 0
 
         if expired or unavailable:
             reason = "task timed out" if expired else "assigned robot became unavailable"
@@ -779,6 +788,9 @@ async def get_task(task_id: str):
                 if task["status"] == "failed" and str(task.get("error", "")).startswith("robot became"):
                     return await reassign_or_fail(task, task["error"])
     except (httpx.HTTPError, ValueError):
+        task["missed_checks"] = task.get("missed_checks", 0) + 1
+        if task["missed_checks"] < 2:
+            return task
         return await reassign_or_fail(task, "robot status check failed")
     return task
 
@@ -801,6 +813,8 @@ def handoff_pickup(task: dict, old_robot: str) -> tuple[dict | None, str]:
 
 
 async def reassign_or_fail(task: dict, reason: str):
+    if task["status"] in ("reassigning", "reassigned"):
+        return task  # another check already handed this task on; never hand it on twice
     # A drive is meant for one physical robot, so it is never moved to another.
     if task["type"] == "drive" or task.get("retry_count", 0) >= task.get("max_retries", MAX_TASK_RETRIES):
         task["status"] = "failed"

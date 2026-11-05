@@ -171,6 +171,7 @@ class RealCarNavigationTests(unittest.TestCase):
         # Speed up the car's calibration so the route runs quickly in the test.
         self.nav.speed *= 40
         self.nav.turn_speed *= 40
+        self.nav.min_power = 0.2  # the slow door approach never goes under this throttle
         self.nav.start("407-1")
         self.run_loop(20, until=lambda: not self.nav.queue)
         self.assertEqual(self.nav.mission["phase"], "door_touched")
@@ -180,7 +181,7 @@ class RealCarNavigationTests(unittest.TestCase):
             if c != sequence[-1]:
                 sequence.append(c)
         power = self.app.MOTOR_POWER
-        slow = power * 0.18 / FLOOR["robot"]["speed"]
+        slow = max(power * 0.18 / FLOOR["robot"]["speed"], self.nav.min_power)
         expected = [(0.0, 0.0), (power, 0.0), (0.0, 0.0), (power, 1.0), (slow, 0.0), (0, 0)]
         # Zero-length back-out at the junction, hallway travel (+v from the junction), pause, right turn (heading -pi/2), slow approach, stop.
         self.assertEqual(door_target("407-1")["heading"], -math.pi / 2)

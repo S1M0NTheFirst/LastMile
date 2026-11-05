@@ -52,13 +52,14 @@ class Navigator:
     holds the (throttle, steering) the car should be driving for that tick.
     """
 
-    def __init__(self, speed=None, turn_speed=None, power=1.0):
+    def __init__(self, speed=None, turn_speed=None, power=1.0, min_power=0.0):
         self.pose = {"u": CENTER_U, "v": 0.0, "heading": 0.0, "space": "floor4"}
         self.mission = {"phase": "idle", "door_id": None}
         self.queue = []
         self.speed = speed or FLOOR["robot"]["speed"]
         self.turn_speed = turn_speed or FLOOR["robot"]["turnSpeed"]
         self.power = power
+        self.min_power = min_power  # a real car stalls below this throttle, so slow phases never go under it
         self.command = (0.0, 0.0)
 
     def _turn_command(self, diff):
@@ -75,12 +76,19 @@ class Navigator:
         self.pose.update(u=ELEVATOR["u"], v=ELEVATOR["v"], heading=math.pi / 2, space="floor4")
         self.mission = {"phase": "at_elevator", "door_id": None}
 
-    def place_at_door(self, door_id):
-        """Put the robot where it sits after touching a door (used to start a real car at a door)."""
+    def place_at_door(self, door_id, facing=None):
+        """Put the robot at a door. By default it has just touched the door (facing it); with
+        facing="right" or "left" it stands on the hallway centerline in front of the door, facing
+        along the hallway toward the right branch (+v, e.g. room 405) or the left one."""
         target = door_target(door_id)
         self.queue = []
         self.command = (0.0, 0.0)
-        self.pose.update(u=target["u"], v=target["v"], heading=target["heading"], space="floor4")
+        if facing in ("right", "left", "wall"):
+            # wall: back to the door, facing the opposite wall (a right turn then points it to +v)
+            heading = {"right": 0.0, "left": math.pi, "wall": math.pi / 2}[facing]
+            self.pose.update(u=CENTER_U, v=target["v"], heading=heading, space="floor4")
+        else:
+            self.pose.update(u=target["u"], v=target["v"], heading=target["heading"], space="floor4")
         self.mission = {"phase": "door_touched", "door_id": door_id}
 
     def _travel(self, at, to):
@@ -174,6 +182,8 @@ class Navigator:
                 return
             # Approach slowly; throttle scales with speed like the drive executor.
             scale = APPROACH_SPEED / FLOOR["robot"]["speed"] if step["phase"] == "approaching_door" else 1.0
+            if scale < 1.0 and self.power:
+                scale = max(scale, min(1.0, self.min_power / self.power))  # the map speed follows the throttle
             speed = self.speed * scale
             travel = min(distance, speed * dt)
             if distance > 1e-9:
