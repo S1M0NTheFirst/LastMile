@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { MapControls } from "three/examples/jsm/controls/MapControls.js";
 import { FLOOR_DATA, CENTER_U, DOORS, doorFeatures } from "./lib/floor4";
 
 const FINAL = ["completed", "failed", "cancelled", "reassigned"];
@@ -109,7 +109,7 @@ function ribbons(scene, paths, color, y) {
   scene.add(mesh);
 }
 
-function label(scene, text, x, y, z, color = "#e9f4ff", scale = 1) {
+function label(scene, text, x, y, z, color = "#e9f4ff", scale = 1, bg = "rgba(7, 22, 36, 0.82)") {
   const c = document.createElement("canvas");
   const ctx = c.getContext("2d");
   const font = "bold 40px Arial, sans-serif";
@@ -117,7 +117,7 @@ function label(scene, text, x, y, z, color = "#e9f4ff", scale = 1) {
   c.width = Math.ceil(ctx.measureText(text).width) + 36;
   c.height = 64;
   ctx.font = font;
-  ctx.fillStyle = "rgba(7, 22, 36, 0.82)";
+  ctx.fillStyle = bg;
   ctx.beginPath();
   ctx.roundRect(0, 0, c.width, c.height, 12);
   ctx.fill();
@@ -1461,7 +1461,7 @@ const BASE_FOV = 55;
 // behind the robot the camera trails, Robot POV by narrowing the field of view.
 const ZOOM = {
   step: 1.35, // one button press / key press
-  overview: { min: 6, max: 360 }, // meters from the orbit target
+  overview: { min: 6, max: 600 }, // meters from the orbit target
   follow: { min: 0.25, max: 5 }, // multiplier on the default follow offset
   pov: { minFov: 12, maxFov: 90 },
 };
@@ -1560,7 +1560,7 @@ function buildRobotMesh(scene, name) {
   ring.position.y = 0.03;
   g.add(ring);
   scene.add(g);
-  const nameLabel = label(scene, name, 0, 1.4, 0, "#ffffff", 0.5);
+  const nameLabel = label(scene, `● ${name}`, 0, 1.4, 0, "#ffffff", 0.5, "rgba(230, 90, 20, 0.92)"); // orange pill, unlike the dark building labels
   nameLabel.userData.aspect = nameLabel.scale.x / nameLabel.scale.y;
   nameLabel.material.sizeAttenuation = false;
   return { group: g, body, ring, nameLabel, trail: [], line: null };
@@ -1586,14 +1586,25 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     scene.add(sun);
 
     // Overview camera can be orbited / panned / zoomed around the campus.
-    const controls = new OrbitControls(cam, ren.domElement);
+    // Free map navigation: left-drag pans anywhere, right-drag rotates/tilts, wheel zooms
+    // toward the cursor. WASD / arrow keys also pan.
+    const controls = new MapControls(cam, ren.domElement);
     controls.target.set(0, 0, 0);
+    controls.zoomToCursor = true;
+    controls.listenToKeyEvents(window);
+    controls.keyPanSpeed = 25;
     controls.enableDamping = true;
     controls.maxPolarAngle = Math.PI * 0.47; // never dip below the ground
     controls.minDistance = ZOOM.overview.min;
     controls.maxDistance = ZOOM.overview.max;
     controls.zoomSpeed = 1.2;
     controls.screenSpacePanning = false;
+    controls.keys = { LEFT: "ArrowLeft", UP: "ArrowUp", RIGHT: "ArrowRight", BOTTOM: "ArrowDown" };
+    const panKeys = new Set();
+    const keyDown = (e) => { if (!/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) panKeys.add(e.key.toLowerCase()); };
+    const keyUp = (e) => panKeys.delete(e.key.toLowerCase());
+    window.addEventListener("keydown", keyDown);
+    window.addEventListener("keyup", keyUp);
 
     // ---- ECS 4th floor ----
     const floor = { group: null, slab: null, anchorMeshes: [], fit: null, view: null };
@@ -2006,8 +2017,8 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       const now = performance.now();
       const dt = Math.min((now - previousFrame) / 1000, 0.1);
       previousFrame = now;
-      // Same (life) size in every view; the name label marks them when zoomed out.
-      const robotScale = 1;
+            // Campus robots drawn 3x so they read on the map; indoors they stay at 1.5x to fit the hallways.
+      const robotScale = robotSpace === "hallway" ? 1.5 : 3;
       const nameRects = [];
       for (const [name, m] of meshes) {
         stepRobot(m, dt);
@@ -2129,6 +2140,19 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
         cam.lookAt(controls.target);
         if (cam.position.distanceTo(flyTo.pos) < 0.5) returning = false;
       } else {
+        if (panKeys.size && !tracking) {
+          const speed = cam.position.distanceTo(controls.target) * 0.9 * dt;
+          const f = tmp.subVectors(controls.target, cam.position).setY(0).normalize();
+          const r = new THREE.Vector3(-f.z, 0, f.x);
+          const move = new THREE.Vector3();
+          if (panKeys.has("w")) move.add(f);
+          if (panKeys.has("s")) move.sub(f);
+          if (panKeys.has("d")) move.add(r);
+          if (panKeys.has("a")) move.sub(r);
+          move.multiplyScalar(speed);
+          cam.position.add(move);
+          controls.target.add(move);
+        }
         controls.update();
       }
       // A full follow orbit can look across a hallway wall. Fade only the surfaces
@@ -2173,6 +2197,8 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       view.removeEventListener("pointercancel", cancelDrag);
       view.removeEventListener("wheel", wheel);
       controls.dispose();
+      window.removeEventListener("keydown", keyDown);
+      window.removeEventListener("keyup", keyUp);
       disposeScene(scene);
       ren.dispose();
       view.removeChild(ren.domElement);
