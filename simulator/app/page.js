@@ -39,21 +39,25 @@ function robotHex(r) {
 const WORLD_RADIUS = 200;
 
 const PALETTE = {
-  ground: 0x1a2a37,
-  grass: 0x24493a,
-  parking: 0x2a333d,
-  plaza: 0x3a4a58,
-  water: 0x1f4f7a,
-  road: 0x2e3944,
-  service: 0x35414d,
-  footway: 0x5a6e7f,
-  cycleway: 0x4f6b6a,
-  steps: 0x6f8191,
-  building: 0x51677c,
+  sky: 0xb9d7ee,
+  ground: 0x8a9a6a,
+  grass: 0x6a9a4a,
+  parking: 0x5b5f64,
+  plaza: 0xcfc6b4,
+  water: 0x3f86bf,
+  road: 0x3a3e44,
+  service: 0x4a4e54,
+  footway: 0xd3cbbb,
+  cycleway: 0xb07a5e,
+  steps: 0xbab2a2,
+  lane: 0xf2e6b0,
+  // CSULB's buildings are mostly cream / sand concrete with some brick and grey panels.
+  facades: [0xe4d7bd, 0xd8c6a4, 0xcdbb98, 0xe9e2d2, 0xb98a6a, 0xc9c4b8, 0xddd0b2],
+  roof: 0x8d8a84,
   anchor: 0x45d5a2,
-  edge: 0x8fb3cc,
-  trunk: 0x4a3a2c,
-  crown: 0x2f6b47,
+  edge: 0x6f6658,
+  trunk: 0x6b4a2f,
+  crown: 0x4f8a3a,
   entrance: 0xffc06b,
   perimeter: 0x45d5a2,
 };
@@ -131,6 +135,32 @@ function label(scene, text, x, y, z, color = "#e9f4ff", scale = 1) {
   return sprite;
 }
 
+// Facade texture: one tile = one 3 m bay x one 3.66 m storey, with a window band.
+let windowTex = null;
+function facadeTexture() {
+  if (windowTex) return windowTex;
+  const c = document.createElement("canvas");
+  c.width = 64;
+  c.height = 64;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, 64, 64);
+  ctx.fillStyle = "#3d5466";
+  ctx.fillRect(8, 18, 48, 30);
+  ctx.fillStyle = "#6f8ea6";
+  ctx.fillRect(10, 20, 20, 12);
+  ctx.fillStyle = "#d9d2c4";
+  ctx.fillRect(31, 18, 2, 30);
+  ctx.fillStyle = "#e0d9cc";
+  ctx.fillRect(0, 52, 64, 4);
+  windowTex = new THREE.CanvasTexture(c);
+  windowTex.colorSpace = THREE.SRGBColorSpace;
+  windowTex.wrapS = windowTex.wrapT = THREE.RepeatWrapping;
+  windowTex.repeat.set(1 / 3, 1 / 3.66);
+  windowTex.anisotropy = 4;
+  return windowTex;
+}
+
 function centroid(ring) {
   let a = 0, cx = 0, cz = 0;
   for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
@@ -158,7 +188,7 @@ function groundAndPerimeter(scene) {
 
   const ring = new THREE.Mesh(
     new THREE.TorusGeometry(WORLD_RADIUS, 0.25, 8, 192),
-    new THREE.MeshBasicMaterial({ color: PALETTE.perimeter, transparent: true, opacity: 0.85 })
+    new THREE.MeshBasicMaterial({ color: PALETTE.perimeter, transparent: true, opacity: 0.5 })
   );
   ring.rotation.x = Math.PI / 2;
   ring.position.y = 0.05;
@@ -170,7 +200,7 @@ function groundAndPerimeter(scene) {
       const t = (i / 128) * Math.PI * 2;
       return new THREE.Vector3(Math.cos(t) * r, 0.07, Math.sin(t) * r);
     });
-    scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0x3d5a70, transparent: true, opacity: 0.35 })));
+    scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.12 })));
   }
   label(scene, "N", 0, 1.5, -WORLD_RADIUS - 5, "#45d5a2", 1.4);
 }
@@ -190,9 +220,13 @@ function buildCampusWorld(scene, layout) {
   ribbons(scene, byKind("cycleway"), PALETTE.cycleway, 0.14);
   ribbons(scene, byKind("footway"), PALETTE.footway, 0.15);
   ribbons(scene, byKind("steps"), PALETTE.steps, 0.16);
+  // Painted center lines on the main roads.
+  ribbons(scene, byKind("road").map((p) => ({ ...p, width: 0.15 })), PALETTE.lane, 0.125);
 
   // Buildings: footprints extruded to their OSM height.
-  const edgeMat = new THREE.LineBasicMaterial({ color: PALETTE.edge, transparent: true, opacity: 0.55 });
+  const edgeMat = new THREE.LineBasicMaterial({ color: PALETTE.edge, transparent: true, opacity: 0.35 });
+  const roofMat = new THREE.MeshStandardMaterial({ color: PALETTE.roof, roughness: 0.9 });
+  const wallMats = PALETTE.facades.map((color) => new THREE.MeshStandardMaterial({ color, map: facadeTexture(), roughness: 0.8 }));
   const labelled = new Set();
   let anchor = null;
   const anchorMeshes = [];
@@ -203,14 +237,16 @@ function buildCampusWorld(scene, layout) {
     const depth = Math.max(1, b.height - (b.minHeight || 0));
     const geo = new THREE.ExtrudeGeometry(shapeFrom(b.outer, b.holes), { depth, bevelEnabled: false });
     geo.rotateX(-Math.PI / 2);
-    const color = b.anchor ? PALETTE.anchor : PALETTE.building;
+    // ExtrudeGeometry groups: 0 = roof/floor caps, 1 = walls.
+    const pick = Math.abs(Math.round(centroid(b.outer)[0] * 7 + centroid(b.outer)[1] * 13)) % wallMats.length;
     const mesh = new THREE.Mesh(
       geo,
-      new THREE.MeshStandardMaterial({
-        color, roughness: 0.6, metalness: 0.08,
-        transparent: b.anchor, opacity: b.anchor ? 0.55 : 1,
-        emissive: b.anchor ? PALETTE.anchor : 0x000000, emissiveIntensity: b.anchor ? 0.12 : 0,
-      })
+      b.anchor
+        ? new THREE.MeshStandardMaterial({
+            color: 0xe4d7bd, roughness: 0.7, transparent: true, opacity: 0.55,
+            emissive: PALETTE.anchor, emissiveIntensity: 0.15,
+          })
+        : [roofMat, wallMats[pick]]
     );
     mesh.position.y = b.minHeight || 0;
     mesh.userData.building = b;
@@ -234,11 +270,13 @@ function buildCampusWorld(scene, layout) {
     const n = layout.trees.length;
     const trunks = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.2, 0.28, 3, 6), new THREE.MeshStandardMaterial({ color: PALETTE.trunk }), n);
     const crowns = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(2.4, 1), new THREE.MeshStandardMaterial({ color: PALETTE.crown, roughness: 0.9, flatShading: true }), n);
+    const tint = new THREE.Color();
     const m = new THREE.Matrix4();
     layout.trees.forEach(([x, z], i) => {
       const s = 0.85 + ((Math.sin(x * 12.9898 + z * 78.233) * 43758.5453) % 1 + 1) % 1 * 0.4; // stable per-tree size
       trunks.setMatrixAt(i, m.makeScale(1, s, 1).setPosition(x, 1.5 * s, z));
       crowns.setMatrixAt(i, m.makeScale(s, s, s).setPosition(x, 3.6 * s, z));
+      crowns.setColorAt(i, tint.setHSL(0.26 + (s - 1) * 0.1, 0.45, 0.32 + (s - 0.85) * 0.2));
     });
     scene.add(trunks, crowns);
   }
@@ -1234,7 +1272,8 @@ function toScene(pos) {
 // line: paths become a graph (ways that share a point are joined) and a trip follows the cheapest
 // route over it, preferring roads to footpaths. The robot itself still reports a straight line
 // plus its progress along it (state.leg); that progress is mapped onto the road route here.
-const ROAD_COST = { road: 1, service: 1, cycleway: 1.4, footway: 2.2, steps: 6 };
+// Steps are left out entirely: a wheeled robot can't climb them.
+const ROAD_COST = { road: 1, service: 1, cycleway: 1.4, footway: 2.2 };
 let roadGraph = null;
 const routeCache = new Map();
 
@@ -1255,7 +1294,8 @@ function buildRoadGraph(paths) {
     return i;
   };
   for (const p of paths) {
-    const weight = ROAD_COST[p.kind] ?? 2.2;
+    const weight = ROAD_COST[p.kind];
+    if (!weight) continue;
     for (let i = 1; i < p.points.length; i++) {
       const a = nodeAt(p.points[i - 1]), b = nodeAt(p.points[i]);
       if (a === b) continue;
@@ -1265,7 +1305,24 @@ function buildRoadGraph(paths) {
       segments.push({ a, b, len, weight });
     }
   }
-  return { nodes, edges, segments };
+  // Keep only segments in the largest connected network, so a trip can never attach to an
+  // isolated scrap of path and fall back to cutting straight across the campus.
+  const comp = new Array(nodes.length).fill(-1);
+  const sizes = [];
+  for (let i = 0; i < nodes.length; i++) {
+    if (comp[i] !== -1) continue;
+    const id = sizes.length, stack = [i];
+    comp[i] = id;
+    let n = 0;
+    while (stack.length) {
+      const k = stack.pop();
+      n++;
+      for (const e of edges[k]) if (comp[e.to] === -1) { comp[e.to] = id; stack.push(e.to); }
+    }
+    sizes.push(n);
+  }
+  const main = sizes.indexOf(Math.max(...sizes));
+  return { nodes, edges, segments: segments.filter((s) => comp[s.a] === main) };
 }
 
 // Joins a point to the nearest spot on a road (not just the nearest road corner, which can be a
@@ -1280,7 +1337,7 @@ function attachToRoad(graph, [x, z]) {
     const d = Math.hypot(x - px, z - pz);
     if (!best || d < best.distance) best = { seg, f, px, pz, distance: d };
   }
-  if (!best || best.distance > 80) return null;
+  if (!best) return null;
   const { seg, f } = best;
   const index = graph.nodes.length;
   graph.nodes.push([best.px, best.pz]);
@@ -1309,7 +1366,9 @@ function roadPath(graph, from, to) {
   if (!s) return null;
   const t = attachToRoad(graph, to);
   try {
-    return t && s.seg !== t.seg ? shortestRoute(graph, s.index, t.index, from, to) : null;
+    if (!t) return null;
+    if (s.seg === t.seg) return [from, graph.nodes[s.index], graph.nodes[t.index], to]; // along one road
+    return shortestRoute(graph, s.index, t.index, from, to);
   } finally {
     t?.detach();
     s.detach();
@@ -1389,6 +1448,7 @@ function legRoute(leg) {
     const a = toScene(leg.from), b = toScene(leg.to);
     const from = [a.x, a.z], to = [b.x, b.z];
     route = withLengths((roadGraph && roadPath(roadGraph, from, to)) || [from, to]);
+    if (!roadGraph) return route; // map still loading: don't cache the straight line
     routeCache.set(key, { ...route, key });
     route = routeCache.get(key);
   }
@@ -1418,31 +1478,86 @@ async function post(url, body) {
 }
 
 function buildRobotMesh(scene, name) {
+  // A six-wheeled sidewalk delivery robot, ~0.62 m long (+x is forward).
   const g = new THREE.Group();
+  const shellMat = new THREE.MeshStandardMaterial({ color: 0xf4f5f2, roughness: 0.35, metalness: 0.05 });
+  const darkMat = new THREE.MeshStandardMaterial({ color: 0x22262b, roughness: 0.6 });
+  const tyreMat = new THREE.MeshStandardMaterial({ color: 0x111316, roughness: 0.9 });
+  const hubMat = new THREE.MeshStandardMaterial({ color: 0x8c939a, roughness: 0.4, metalness: 0.6 });
+  const rounded = (w, h, d, r) => {
+    const shape = new THREE.Shape();
+    const x = -w / 2, y = -h / 2;
+    shape.moveTo(x + r, y);
+    shape.lineTo(x + w - r, y);
+    shape.quadraticCurveTo(x + w, y, x + w, y + r);
+    shape.lineTo(x + w, y + h - r);
+    shape.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    shape.lineTo(x + r, y + h);
+    shape.quadraticCurveTo(x, y + h, x, y + h - r);
+    shape.lineTo(x, y + r);
+    shape.quadraticCurveTo(x, y, x + r, y);
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: d, bevelEnabled: true, bevelSize: 0.015, bevelThickness: 0.015, bevelSegments: 3 });
+    geo.translate(0, 0, -d / 2);
+    return geo;
+  };
+  // Lower chassis (dark) and the white cargo shell on top.
+  const chassis = new THREE.Mesh(rounded(0.6, 0.12, 0.4, 0.04), darkMat);
+  chassis.position.y = 0.17;
+  g.add(chassis);
+  const shell = new THREE.Mesh(rounded(0.62, 0.26, 0.44, 0.08), shellMat);
+  shell.position.y = 0.37;
+  g.add(shell);
+  // Lid seam and handle.
+  const lid = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.012, 0.42), darkMat);
+  lid.position.set(-0.02, 0.47, 0);
+  g.add(lid);
+  // Status light band around the shell: its color shows the robot's state.
   const body = new THREE.Mesh(
-    new THREE.BoxGeometry(0.62, 0.3, 0.46),
-    new THREE.MeshStandardMaterial({ color: COLORS.alive, emissive: COLORS.alive, emissiveIntensity: 0.18, metalness: 0.25 })
+    new THREE.BoxGeometry(0.64, 0.025, 0.46),
+    new THREE.MeshStandardMaterial({ color: COLORS.alive, emissive: COLORS.alive, emissiveIntensity: 0.9 })
   );
-  body.position.y = 0.3;
+  body.position.y = 0.26;
   g.add(body);
-  const top = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.12, 0.25), new THREE.MeshStandardMaterial({ color: 0xf0f6fb, metalness: 0.25 }));
-  top.position.y = 0.49;
-  g.add(top);
-  [-0.2, 0.2].forEach((x) => {
-    const w = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.08, 12), new THREE.MeshStandardMaterial({ color: 0x0b1520 }));
-    w.rotation.z = Math.PI / 2;
-    w.position.set(x, 0.13, 0.2);
-    g.add(w);
+  // Front sensor face with camera and headlights.
+  const face = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.12, 0.3), new THREE.MeshStandardMaterial({ color: 0x0c0f12, roughness: 0.15, metalness: 0.3 }));
+  face.position.set(0.322, 0.38, 0);
+  g.add(face);
+  const lightMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xfff6d8, emissiveIntensity: 1.2 });
+  [-0.11, 0.11].forEach((z) => {
+    const l = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.012, 16), lightMat);
+    l.rotation.z = Math.PI / 2;
+    l.position.set(0.334, 0.38, z);
+    g.add(l);
   });
-  const ant = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.018, 0.018, 0.22, 8),
-    new THREE.MeshStandardMaterial({ color: 0xffbd67, emissive: 0xffbd67, emissiveIntensity: 0.7 })
-  );
-  ant.position.y = 0.67;
+  const tail = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.03, 0.3), new THREE.MeshStandardMaterial({ color: 0xff3b3b, emissive: 0xff2020, emissiveIntensity: 0.8 }));
+  tail.position.set(-0.322, 0.4, 0);
+  g.add(tail);
+  // Six wheels, three per side.
+  for (const x of [-0.21, 0, 0.21]) {
+    for (const z of [-0.235, 0.235]) {
+      const w = new THREE.Mesh(new THREE.CylinderGeometry(0.085, 0.085, 0.06, 20), tyreMat);
+      w.rotation.x = Math.PI / 2;
+      w.position.set(x, 0.085, z);
+      g.add(w);
+      const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 0.062, 12), hubMat);
+      hub.rotation.x = Math.PI / 2;
+      hub.position.copy(w.position);
+      g.add(hub);
+    }
+  }
+  // Whip antenna with an orange safety flag.
+  const ant = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.7, 6), darkMat);
+  ant.position.set(-0.24, 0.85, 0.16);
   g.add(ant);
-  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.025, 8, 24), new THREE.MeshBasicMaterial({ color: COLORS.alive, transparent: true, opacity: 0.8 }));
+  const flag = new THREE.Mesh(
+    new THREE.BoxGeometry(0.12, 0.08, 0.005),
+    new THREE.MeshStandardMaterial({ color: 0xff7a1a, emissive: 0xff7a1a, emissiveIntensity: 0.35 })
+  );
+  flag.position.set(-0.18, 1.16, 0.16);
+  g.add(flag);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.02, 8, 32), new THREE.MeshBasicMaterial({ color: COLORS.alive, transparent: true, opacity: 0.7 }));
   ring.rotation.x = Math.PI / 2;
-  ring.position.y = 0.04;
+  ring.position.y = 0.03;
   g.add(ring);
   scene.add(g);
   const nameLabel = label(scene, name, 0, 1.4, 0, "#ffffff", 0.5);
@@ -1456,17 +1571,17 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
     const view = viewRef.current;
     let disposed = false;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x07131f);
+    scene.background = new THREE.Color(PALETTE.sky);
     // Max camera distance is 360 m; keep the full 100 m campus visible from there.
-    scene.fog = new THREE.Fog(0x07131f, 600, 1100);
+    scene.fog = new THREE.Fog(PALETTE.sky, 500, 1100);
     const cam = new THREE.PerspectiveCamera(55, 1, 0.1, 2000);
     cam.position.copy(HOME);
     const ren = new THREE.WebGLRenderer({ antialias: true });
     ren.localClippingEnabled = true; // used to cut away ECS above the 4th floor in the 4F view
     ren.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     view.appendChild(ren.domElement);
-    scene.add(new THREE.HemisphereLight(0xbcd8f0, 0x1a2a37, 1.6));
-    const sun = new THREE.DirectionalLight(0xffffff, 2.4);
+    scene.add(new THREE.HemisphereLight(0xdbeaf7, 0x6b6450, 1.5));
+    const sun = new THREE.DirectionalLight(0xfff4e0, 2.6);
     sun.position.set(60, 120, 40); // afternoon sun from the southwest-ish, high in the sky
     scene.add(sun);
 
@@ -1891,9 +2006,8 @@ function useScene(viewRef, robotsRef, uiRef, onPick, onWorld, zoomRef, onZoom, o
       const now = performance.now();
       const dt = Math.min((now - previousFrame) / 1000, 0.1);
       previousFrame = now;
-      // Robots are ~0.6 m long; enlarge them in wide views so they read at that scale.
-      // In the hallways they stay life-size except in the far-away campus overview.
-      const robotScale = robotSpace === "hallway" ? (mode === "overview" ? 2.5 : 1) : mode === "overview" || mode === "floor4" ? 4 : 1;
+      // Same (life) size in every view; the name label marks them when zoomed out.
+      const robotScale = 1;
       const nameRects = [];
       for (const [name, m] of meshes) {
         stepRobot(m, dt);
